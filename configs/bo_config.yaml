@@ -1,0 +1,19 @@
+# 贝叶斯优化参数
+ref_point: [170.0, 0, 0]  # 参考点(成本,赖氨酸,能量)
+n_iter: 15                  # 优化迭代次数
+batch_size: 3                # 每批评估数量
+num_restarts: 20             # 优化重启次数
+raw_samples: 512             # 初始采样数
+hv_improve_tol: 1e-4         # HV改进容忍度
+
+# 采集函数参数
+acqf_params:
+  xi: 0.01                   # 探索系数
+  beta: 0.2                  # 置信区间系数
+  maximize: True             # 是否最大化目标
+
+# 模型参数
+model:
+  lengthscale_prior: [0.1, 1.0]  # 长度尺度先验
+  noise_prior: [0.001, 0.1]      # 噪声先验
+

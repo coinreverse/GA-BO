@@ -1,0 +1,20 @@
+# 遗传算法基础参数
+pop_size: 200
+n_gen: 50
+n_offsprings: 100
+seed: 42
+verbose: True
+
+# 交叉算子配置
+crossover:
+  prob: 0.9    # 交叉概率
+  eta: 15      # 分布指数
+
+# 变异算子配置
+mutation:
+  prob: 0.2    # 变异概率
+  eta: 20      # 分布指数
+
+# 其他参数
+eliminate_duplicates: True
+sampling: Dirichlet
