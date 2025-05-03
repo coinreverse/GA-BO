@@ -5,7 +5,8 @@ import yaml
 
 
 class FeedEvaluator:
-    def __init__(self, config_path: str = "configs/feed_config.yaml", device: Optional[str] = None, precision: str = 'float32'):
+    def __init__(self, config_path: str = "configs/feed_config.yaml", device: Optional[str] = None,
+                 precision: str = 'float32'):
         """
         从 YAML 文件加载所有配置的饲料配方评估器
 
@@ -28,8 +29,10 @@ class FeedEvaluator:
         self.nutrition = torch.tensor(config["nutrition"], device=self.device, dtype=self.precision)
         self.lower_bounds = torch.tensor(config["nutrient_bounds"]["lower"], device=self.device, dtype=self.precision)
         self.upper_bounds = torch.tensor(config["nutrient_bounds"]["upper"], device=self.device, dtype=self.precision)
-        self.ingredient_lower_bounds = torch.tensor(config["ingredient_bounds"]["lower"], device=self.device, dtype=self.precision)
-        self.ingredient_upper_bounds = torch.tensor(config["ingredient_bounds"]["upper"], device=self.device, dtype=self.precision)
+        self.ingredient_lower_bounds = torch.tensor(config["ingredient_bounds"]["lower"], device=self.device,
+                                                    dtype=self.precision)
+        self.ingredient_upper_bounds = torch.tensor(config["ingredient_bounds"]["upper"], device=self.device,
+                                                    dtype=self.precision)
 
         # 加载其他配置
         self.tol = config["settings"]["tol"]
@@ -50,6 +53,7 @@ class FeedEvaluator:
             X: (n_samples, 17) 原料配比矩阵 (NumPy数组或PyTorch张量)
             tol: 配比总和的容差阈值
         """
+
         # 转换输入为PyTorch张量
         if not isinstance(X, torch.Tensor):
             X = torch.tensor(X, dtype=self.precision, device=self.device)
@@ -60,27 +64,34 @@ class FeedEvaluator:
         batch_size = X.shape[0]
         results = torch.full((batch_size, 11), 1e6, device=self.device, dtype=self.precision)  # 11个输出指标（成本+10种营养素）
 
-        # 检查约束条件
+        # 检查约束条件（增强版）
         sum_deviation = torch.abs(X.sum(dim=1) - 1)
-        valid_mask = (sum_deviation < tol) & ~(X < 0).any(dim=1) & ~(X > 1).any(dim=1)
+        ingredient_violation = ((X < self.ingredient_lower_bounds) | (X > self.ingredient_upper_bounds)).any(dim=1)
+        valid_mask = (sum_deviation < tol) & ~ingredient_violation
 
         # 只对有效样本进行计算
         if valid_mask.any():
             X_valid = X[valid_mask]
 
-            # 计算目标指标 (成本 + 10种营养素)
-            cost = X_valid @ self.costs
-            nutrients = X_valid @ self.nutrition
+            # 计算目标指标（增加数值保护）
+            with torch.no_grad():
+                cost = X_valid @ self.costs
+                nutrients = X_valid @ self.nutrition
 
-            # 添加微小随机扰动（避免完全相同的目标值）
-            noise_scale = 1e-6
-            cost = cost + torch.randn(cost.shape, device=self.device) * noise_scale
-            nutrients = nutrients + torch.randn(nutrients.shape, device=self.device) * noise_scale
+                # 添加可控的随机扰动
+                noise_scale = 1e-6 * cost.abs().mean().item()  # 自适应噪声比例
+                cost = cost + torch.randn_like(cost) * noise_scale
+                nutrients = nutrients + torch.randn_like(nutrients) * noise_scale
 
-            # 填充有效结果
-            results[valid_mask] = torch.cat([cost.unsqueeze(1), nutrients], dim=1)
+                # 确保数值有效
+                cost = torch.nan_to_num(cost, nan=1e6, posinf=1e6, neginf=1e6)
+                nutrients = torch.nan_to_num(nutrients, nan=1e6, posinf=1e6, neginf=1e6)
+
+                # 填充有效结果
+                results[valid_mask] = torch.cat([cost.unsqueeze(1), nutrients], dim=1)
 
         return results
+
 
     def check_constraints(self, X: torch.Tensor) -> Tuple[bool, str]:
         """
@@ -122,6 +133,7 @@ class FeedEvaluator:
 
         return True, "配方有效"
 
+
     def generate_random_formula(self, n_samples: int = 1) -> torch.Tensor:
         """
         生成随机配方 (满足总和=1和原料用量限制)
@@ -147,6 +159,7 @@ class FeedEvaluator:
 
         return torch.stack(samples)
 
+
     def optimize_cost(self, max_iter: int = 1000) -> Tuple[torch.Tensor, float]:
         """
         优化配方成本 (模拟第一份代码的优化过程)
@@ -166,6 +179,7 @@ class FeedEvaluator:
                 best_formula = formula.clone()
 
         return best_formula, best_cost
+
 
     def optimize_nutrient(self, target_nutrient: int, maximize: bool = True,
                           max_iter: int = 1000) -> Tuple[torch.Tensor, float]:
@@ -194,10 +208,12 @@ class FeedEvaluator:
 
         return best_formula, best_value
 
+
     @staticmethod
     def get_nutrient_names() -> list:
-        """获取营养素名称 (与第一份代码一致)"""
+        """获取营养素名称"""
         return ['CF', 'Ca', 'AP', 'DM', 'CP', 'MC', 'T', 'Tp', 'Energy', 'L']
+
 
     def to_dataframe(self, X: torch.Tensor) -> pd.DataFrame:
         """
@@ -226,4 +242,3 @@ class FeedEvaluator:
             df[name] = nutrients[:, i].cpu().numpy()
 
         return df
-

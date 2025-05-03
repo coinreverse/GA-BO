@@ -10,8 +10,6 @@ from botorch.utils.multi_objective.box_decompositions.dominated import Dominated
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from typing import Tuple, Optional, Dict, List
 
-from scipy.stats._mstats_basic import winsorize
-
 
 class BOOptimizer:
     def __init__(
@@ -91,9 +89,17 @@ class BOOptimizer:
         Returns:
             优化后的解和目标值
         """
-        # 确保输入是双精度
-        X_init = X_init.to(dtype=self.precision, device=self.device, )
-        Y_init = Y_init.to(dtype=self.precision, device=self.device)
+        # 确保输入是 PyTorch 张量
+        if not isinstance(Y_init, torch.Tensor):
+            Y_init = torch.tensor(Y_init, dtype=self.precision, device=self.device)
+        else:
+            Y_init = Y_init.to(dtype=self.precision, device=self.device)
+
+        # 确保 X_init 也是 PyTorch 张量
+        if not isinstance(X_init, torch.Tensor):
+            X_init = torch.tensor(X_init, dtype=self.precision, device=self.device)
+        else:
+            X_init = X_init.to(dtype=self.precision, device=self.device)
 
         self.initialize(X_init, Y_init)
 
@@ -141,26 +147,12 @@ class BOOptimizer:
         if torch.any(torch.isnan(self._Y)) or torch.any(torch.isinf(self._Y)):
             raise ValueError("Y contains NaN or Inf values")
 
-        # 改进标准化方法，添加winsorize处理异常值
-        winsorized_Y = torch.from_numpy(
-            winsorize(
-                self._Y.cpu().numpy(),
-                limits=(0.05, 0.05),  # 截断前后5%的极端值
-                axis=0
-            )
-        ).to(self._Y)
-
-        # 标准化处理
-        Y_mean = winsorized_Y.mean(0)
-        Y_std = winsorized_Y.std(0)
-        Y_std[Y_std < 1e-6] = 1e-6  # 防止除零
-        train_Y = (winsorized_Y - Y_mean) / Y_std
-
+        train_Y = self._Y.clone()
         # 创建模型
         self._model = SingleTaskGP(
             self._X,
             train_Y,
-            outcome_transform=Standardize(m=winsorized_Y.shape[-1])  # 添加标准化转换
+            outcome_transform=Standardize(m=train_Y.shape[-1])  # 添加标准化转换
         )
 
         # 设置更强的噪声约束
@@ -172,7 +164,6 @@ class BOOptimizer:
         # 添加模型训练参数
         mll = ExactMarginalLogLikelihood(self._model.likelihood, self._model)
         fit_gpytorch_mll(mll)
-
 
     def get_next_candidate(self, batch_size: int = 1) -> torch.Tensor:
         if self._model is None:
@@ -219,7 +210,6 @@ class BOOptimizer:
         # 添加边界检查
         candidates = torch.clamp(candidates, min=self.bounds[0], max=self.bounds[1])
         return candidates.detach()
-
 
     def update(self, X_new: torch.Tensor, Y_new: torch.Tensor):
         """更新观测数据"""

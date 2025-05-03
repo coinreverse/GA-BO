@@ -1,6 +1,6 @@
 # 遗传算法基础参数
 pop_size: 200
-n_gen: 50
+n_gen: 100
 n_offsprings: 100
 seed: 42
 verbose: True

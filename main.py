@@ -1,6 +1,8 @@
 import torch
+import numpy as np
 from typing import Dict, Any
 import yaml
+from sklearn.preprocessing import StandardScaler
 from core.genetic_algorithm import run_ga
 from core.bayesian_optim import BOOptimizer
 from core.evaluator import FeedEvaluator
@@ -43,13 +45,25 @@ def main():
 
     # 阶段1: GA全局探索
     print("\n=== Phase 1: Genetic Algorithm Exploration ===")
-    ga_history = []
 
-    X_ga, Y_ga = run_ga(
+    X_ga, Y_ga, ga_population, ga_history = run_ga(
         evaluator=evaluator,
         config_path="configs/ga_config.yaml",
     )
 
+    print("\nHypervolume History:")
+    for gen, hv in enumerate(ga_history):
+        print(f"Generation {gen * 5}: HV = {hv:.4f}")  # 每5代记录一次
+
+    # 可视化HV变化曲线
+    plt.figure(figsize=(10, 6))
+    plt.plot(np.arange(len(ga_history)) * 5, ga_history, 'b-o')
+    plt.xlabel("Generation")
+    plt.ylabel("Hypervolume")
+    plt.title("GA Hypervolume Progression")
+    plt.grid(True)
+    plt.savefig("results/ga_hv_progression.png")
+    plt.close()
     # 可视化GA结果
     fig_ga = plot_pareto_front(
         Y_ga,
@@ -59,10 +73,16 @@ def main():
     )
     plt.savefig("results/ga_pareto.png")
     plt.close()
-
+    # 在GA阶段检查约束违反情况
+    if hv == 0:
+        print("警告：约束已满足但目标无改进！")
+        print("可能原因：")
+        print("- 可行域内所有解目标值相同")
+        print("- 目标函数计算错误")
     # 自适应切换决策
     if strategy.should_switch_to_bo(
-            ga_history,
+            ga_history=ga_history,
+            ga_population=ga_population if ga_population.numel() > 0 else None,
             window=hybrid_config['window_size'],
             tol=hybrid_config['improvement_tol'],
             min_iter=hybrid_config['min_ga_iter']
@@ -70,17 +90,39 @@ def main():
         # 阶段2: BO局部开发
         print("\n=== Phase 2: Bayesian Optimization Refinement ===")
 
+        # 1. 清洗GA结果
+        def clean_ga_results(Y_ga, max_threshold=1e6):
+            """剔除超出阈值的异常解"""
+            # 确保使用PyTorch操作（如果Y_ga是torch.Tensor）
+            if isinstance(Y_ga, torch.Tensor):
+                # 先统一目标方向
+                Y_adjusted = Y_ga.clone()
+                Y_adjusted[:, 0] = -Y_adjusted[:, 0]  # 成本取反
+
+                # 剔除异常值
+                valid_mask = torch.all(Y_adjusted < max_threshold, dim=1)
+                return X_ga[valid_mask], Y_ga[valid_mask]
+            else:
+                valid_mask = np.all(Y_ga < max_threshold, axis=1)
+                return X_ga[valid_mask], Y_ga[valid_mask]
+
+        X_ga_clean, Y_ga_clean = clean_ga_results(Y_ga.cpu().numpy() if torch.is_tensor(Y_ga) else Y_ga)
+
+        # 转换为张量（如果需要）
+        if not isinstance(X_ga_clean, torch.Tensor):
+            X_ga_clean = torch.tensor(X_ga_clean, dtype=torch.float32)
+        if not isinstance(Y_ga_clean, torch.Tensor):
+            Y_ga_clean = torch.tensor(Y_ga_clean, dtype=torch.float32)
+
         # 准备BO初始样本
         X_init = strategy.initialize_bo(
-            (X_ga, Y_ga),
+            (X_ga_clean, Y_ga_clean),
             n_samples=bo_config['raw_samples'],
             noise_scale=hybrid_config['noise_scale'],
-            include_extreme=True
+            include_extreme=False
         )
         Y_init = evaluator(X_init)
-
-        print(f"Initial X range: {X_init.min()} - {X_init.max()}")
-        print(f"Initial Y range: {Y_init.min()} - {Y_init.max()}")
+        Y_init = np.clip(Y_init.cpu().numpy(), 0, 1e4)  # 硬截断
 
         # 运行BO优化
         bo = BOOptimizer(
@@ -97,12 +139,6 @@ def main():
             evaluator=lambda x: evaluator(x)[:, [0, 1 + nutrient_names.index('L'), 1 + nutrient_names.index('Energy')]]
         )
 
-        # nutrient_names = evaluator.get_nutrient_names()
-        # # 动态获取列索引
-        # cost_idx = 0  # 成本是第0列
-        # lysin_idx = 1 + nutrient_names.index('L')  # 赖氨酸在营养指标中的位置 +1（因成本占第0列）
-        # energy_idx = 1 + nutrient_names.index('Energy')  # 同理
-        # Y_hybrid = Y_hybrid[:, [cost_idx, lysin_idx, energy_idx]]
         # 合并GA和BO结果
         X_hybrid = torch.cat([X_ga, X_hybrid])
         Y_hybrid = torch.cat([Y_ga, Y_hybrid])

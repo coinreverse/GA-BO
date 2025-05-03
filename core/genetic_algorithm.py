@@ -9,8 +9,10 @@ from pymoo.optimize import minimize
 from pymoo.core.problem import Problem
 from pymoo.operators.sampling.rnd import FloatRandomSampling
 from pymoo.operators.sampling.lhs import LHS
+from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 from botorch.utils.multi_objective import pareto
 from typing import Tuple
+from core.hybrid_strategy import HybridStrategy
 
 
 class NormalizationRepair:
@@ -38,6 +40,7 @@ class NormalizationRepair:
 
         pop.set("X", X)
         return pop
+
 
 # 自定义采样器 - 确保初始种群满足总和=1
 class DirichletSampling(FloatRandomSampling):
@@ -77,6 +80,9 @@ class FeedProblem(Problem):
         self.current_gen = 0
         self.nutrient_names = evaluator.get_nutrient_names()
         self.repair = NormalizationRepair(self.xu)  # 添加修复算子
+        ref_point = torch.tensor([-200.0, 0.0, 0.0])
+        self.strategy = HybridStrategy(ref_point)
+        self.ga_history = []
 
     def _evaluate(self, X, out, *args, **kwargs):
         # 转换为PyTorch张量
@@ -95,7 +101,6 @@ class FeedProblem(Problem):
             nutrient_values - self.evaluator.upper_bounds
         ]
 
-
         # 合并所有约束 (n_samples, 55)
         out["G"] = torch.cat(constraints, dim=1).cpu().numpy()
 
@@ -109,6 +114,29 @@ class FeedProblem(Problem):
             energy_idx = 1 + nutrient_names.index('Energy')  # 同理
             out["F"] = objectives[:, [cost_idx, lysin_idx, energy_idx]].cpu().numpy()  # 成本、赖氨酸、能量
             out["F"][:, 0] *= -1  # 成本取负以实现最小化
+
+        if self.current_gen % 5 == 0:
+            fronts = NonDominatedSorting().do(out["F"])
+            pareto_mask = fronts[0]
+
+            # 确保转换为正确的张量格式
+            pareto_front = torch.tensor(out["F"][pareto_mask],
+                                        dtype=torch.float32,
+                                        device=self.evaluator.device)
+
+            # 调整目标方向（如果需要）
+            # 假设第一个目标是成本（最小化），其他是最大化
+            pareto_front[:, 0] = -pareto_front[:, 0]
+
+            try:
+                hv = self.strategy.compute_hypervolume(pareto_front)
+                self.ga_history.append(hv)
+                print(f"Generation {self.current_gen}: HV = {hv:.4f}")  # 调试输出
+            except AttributeError as e:
+                print(f"Error computing HV: {str(e)}")
+                print("检查 evaluator.strategy 是否存在:", hasattr(self.evaluator, 'strategy'))
+
+        self.current_gen += 1
 
 
 def run_ga(
@@ -132,7 +160,6 @@ def run_ga(
 
     # 初始化问题
     problem = FeedProblem(evaluator)
-
 
     # 动态加载采样器
     sampling_mapping = {
@@ -175,9 +202,11 @@ def run_ga(
 
     # 恢复成本原始值 (去掉负号)
     F[:, 0] = -F[:, 0]
-
-
-    return X, F
+    population = torch.tensor(res.pop.get("X"), dtype=torch.float32, device=evaluator.device) if hasattr(res,
+                                                                                                         'pop') else torch.tensor(
+        [])
+    ga_history = problem.ga_history if hasattr(problem, 'ga_history') else []
+    return X, F, population, ga_history
 
 
 def get_pareto_front(X: torch.Tensor, F: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
