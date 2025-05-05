@@ -1,9 +1,9 @@
 # 遗传算法基础参数
-pop_size: 200
-n_gen: 100
-n_offsprings: 100
-seed: 42
-verbose: True
+pop_size: 200   # 种群大小
+n_gen: 100      # 进化代数
+#n_offsprings: 100
+#seed: 42
+#verbose: True
 
 # 交叉算子配置
 crossover:
@@ -12,9 +12,9 @@ crossover:
 
 # 变异算子配置
 mutation:
-  prob: 0.2    # 变异概率
+  prob: 0.3    # 变异概率
   eta: 20      # 分布指数
 
 # 其他参数
-eliminate_duplicates: True
+#eliminate_duplicates: True
 sampling: Dirichlet

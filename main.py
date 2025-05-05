@@ -2,7 +2,6 @@ import torch
 import numpy as np
 from typing import Dict, Any
 import yaml
-from sklearn.preprocessing import StandardScaler
 from core.genetic_algorithm import run_ga
 from core.bayesian_optim import BOOptimizer
 from core.evaluator import FeedEvaluator
@@ -51,19 +50,6 @@ def main():
         config_path="configs/ga_config.yaml",
     )
 
-    print("\nHypervolume History:")
-    for gen, hv in enumerate(ga_history):
-        print(f"Generation {gen * 5}: HV = {hv:.4f}")  # 每5代记录一次
-
-    # 可视化HV变化曲线
-    plt.figure(figsize=(10, 6))
-    plt.plot(np.arange(len(ga_history)) * 5, ga_history, 'b-o')
-    plt.xlabel("Generation")
-    plt.ylabel("Hypervolume")
-    plt.title("GA Hypervolume Progression")
-    plt.grid(True)
-    plt.savefig("results/ga_hv_progression.png")
-    plt.close()
     # 可视化GA结果
     fig_ga = plot_pareto_front(
         Y_ga,
@@ -73,13 +59,9 @@ def main():
     )
     plt.savefig("results/ga_pareto.png")
     plt.close()
-    # 在GA阶段检查约束违反情况
-    if hv == 0:
-        print("警告：约束已满足但目标无改进！")
-        print("可能原因：")
-        print("- 可行域内所有解目标值相同")
-        print("- 目标函数计算错误")
+
     # 自适应切换决策
+    # if False:
     if strategy.should_switch_to_bo(
             ga_history=ga_history,
             ga_population=ga_population if ga_population.numel() > 0 else None,
@@ -119,7 +101,6 @@ def main():
             (X_ga_clean, Y_ga_clean),
             n_samples=bo_config['raw_samples'],
             noise_scale=hybrid_config['noise_scale'],
-            include_extreme=False
         )
         Y_init = evaluator(X_init)
         Y_init = np.clip(Y_init.cpu().numpy(), 0, 1e4)  # 硬截断

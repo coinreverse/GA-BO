@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from botorch.utils.multi_objective import pareto
-from typing import Tuple, List, Optional
+from typing import Tuple, List
 from botorch.utils.multi_objective.hypervolume import Hypervolume
 
 
@@ -40,6 +40,7 @@ class HybridStrategy:
             bool: 是否切换到BO
         """
         # 基本条件检查
+        return True
         if len(ga_history) < max(window, min_iter):
             print(
                 f"不满足最小迭代次数条件: len(ga_history)={len(ga_history)} < max(window={window}, min_iter={min_iter})")
@@ -128,80 +129,84 @@ class HybridStrategy:
     def initialize_bo(
             self,
             ga_results: Tuple[torch.Tensor, torch.Tensor],
-            n_samples: int = 50,
+            n_samples: int = 30,
             noise_scale: float = 0.05,
     ) -> torch.Tensor:
         """
-        增强的BO初始化方法
+        混合策略BO初始化：帕累托前沿 + 各目标最优解 + 多样性补充
 
         Args:
             ga_results: (X_ga, Y_ga) 元组
-            n_samples: 总样本数
+            n_samples: 总样本数（默认30）
             noise_scale: 扰动幅度
-            include_perturbations: 是否包含扰动样本
-            include_extreme: 是否包含极端解
 
         Returns:
             X_init: 初始化样本集 (n_samples, n_var)
         """
         X_ga, Y_ga = ga_results
+        device = X_ga.device
 
-        # 确保类型正确
-        X_ga = X_ga.float() if isinstance(X_ga, torch.Tensor) else torch.tensor(X_ga).float()
-        Y_ga = Y_ga.float() if isinstance(Y_ga, torch.Tensor) else torch.tensor(Y_ga).float()
+        # 类型转换确保安全
+        X_ga = X_ga.float() if isinstance(X_ga, torch.Tensor) else torch.tensor(X_ga, device=device).float()
+        Y_ga = Y_ga.float() if isinstance(Y_ga, torch.Tensor) else torch.tensor(Y_ga, device=device).float()
 
-        # 精英选择
-        elites_X, _ = self.elite_selection(X_ga, Y_ga)
-        n_elites = len(elites_X)
+        # === 核心策略 ===
+        samples = []
 
-        # 处理空精英集的情况
-        if n_elites == 0:
-            return torch.rand(n_samples, X_ga.shape[1], device=X_ga.device)
+        # 1. 保留所有帕累托前沿解
+        pareto_mask = pareto.is_non_dominated(Y_ga)
+        pareto_X, pareto_Y = X_ga[pareto_mask], Y_ga[pareto_mask]
+        samples.append(pareto_X)
+        print(f"保留帕累托解: {len(pareto_X)}个")
 
-        # 计算扰动样本数量（不超过精英数量）
-        n_perturb = min(n_samples - n_elites, n_elites)
-        n_random = max(0, n_samples - n_elites - n_perturb)
-
-        # 生成扰动样本
-        noise = torch.randn(n_elites, X_ga.shape[1], device=X_ga.device) * float(noise_scale)
-        perturbed = elites_X + noise[:n_elites]  # 确保形状匹配
-        perturbed = torch.clamp(perturbed, 0, 1)
-
-        # 组合样本（精英+扰动+随机）
-        samples = [
-            elites_X,
-            perturbed[:n_perturb],  # 只取需要的数量
-            torch.rand(n_random, X_ga.shape[1], device=X_ga.device)
+        # 2. 添加各目标方向的最优解（即使被支配）
+        objective_directions = [
+            (0, False),  # 成本最小化
+            (1, True),  # 赖氨酸最大化
+            (2, True)  # 能量最大化
         ]
 
-        return torch.cat([x for x in samples if len(x) > 0], dim=0)[:n_samples]
+        for obj_idx, is_maximize in objective_directions:
+            if is_maximize:
+                idx = torch.argmax(Y_ga[:, obj_idx])
+            else:
+                idx = torch.argmin(Y_ga[:, obj_idx])
 
-    def compute_hypervolume(self, Y: torch.Tensor) -> float:
-        """计算超体积指标"""
-        # 确保输入是张量
-        Y = Y.float() if isinstance(Y, torch.Tensor) else torch.tensor(Y).float()
+            # 检查是否已在帕累托解中
+            if not pareto_mask[idx]:
+                samples.append(X_ga[idx].unsqueeze(0))
+                print(f"添加{['成本', '赖氨酸', '能量'][obj_idx]}最优解 (被支配)")
 
-        # 检查无效值
-        if torch.isnan(Y).any() or torch.isinf(Y).any() or len(Y) == 0:
-            return 0.0
+        # 3. 添加被支配解中成本最低的5个解（确保成本敏感）
+        non_pareto_mask = ~pareto_mask
+        if non_pareto_mask.sum() > 0:
+            non_pareto_Y = Y_ga[non_pareto_mask]
+            non_pareto_X = X_ga[non_pareto_mask]
+            cost_indices = torch.argsort(non_pareto_Y[:, 0])[:5]  # 成本最低的5个
+            samples.append(non_pareto_X[cost_indices])
+            print(f"添加被支配解中成本最低的{len(cost_indices)}个解")
 
-        # 调整目标方向（假设列顺序：成本、赖氨酸、能量）
-        adjusted_front = torch.stack([
-            -Y[:, 0],  # 成本最小化→转为最大化
-            Y[:, 1],  # 赖氨酸（最大化）
-            Y[:, 2]  # 能量（最大化）
-        ], dim=1)
+        # 合并已有样本
+        X_combined = torch.cat(samples, dim=0) if samples else torch.rand(n_samples, X_ga.shape[1], device=device)
+        n_current = len(X_combined)
 
-        # 动态设置参考点（比当前最差解更差）
-        nadir_point = torch.min(adjusted_front, dim=0).values
-        ref_point = nadir_point - 0.1 * torch.abs(nadir_point)
+        # 4. 补充扰动样本（围绕精英解）
+        if n_current < n_samples:
+            n_perturb = min(n_samples - n_current, len(pareto_X))
+            noise = torch.randn(n_perturb, X_ga.shape[1], device=device) * noise_scale
+            perturbed = pareto_X[:n_perturb] + noise
+            perturbed = torch.clamp(perturbed, 0, 1)
+            X_combined = torch.cat([X_combined, perturbed])
+            print(f"添加{len(perturbed)}个扰动样本")
 
-        # 确保参考点合理
-        ref_point = torch.maximum(ref_point, torch.tensor([-1e6, -1e6, -1e6], device=Y.device))
+        # 5. 最后用随机样本补足（确保多样性）
+        if len(X_combined) < n_samples:
+            n_random = n_samples - len(X_combined)
+            X_combined = torch.cat([X_combined, torch.rand(n_random, X_ga.shape[1], device=device)])
+            print(f"添加{n_random}个随机样本")
 
-        # 计算HV
-        try:
-            hv = Hypervolume(ref_point=ref_point)
-            return hv.compute(adjusted_front).item()
-        except:
-            return 0.0
+        # 去重（避免重复样本影响BO）
+        X_init = torch.unique(X_combined, dim=0)[:n_samples]
+        print(f"最终初始样本数: {len(X_init)} (去重后)")
+
+        return X_init

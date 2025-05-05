@@ -8,7 +8,7 @@ from typing import Union
 def plot_pareto_front(
         Y: Union[np.ndarray, torch.Tensor],
         title: str = "Pareto Front",
-        labels: tuple = ("Cost (¥/kg)", "Lysine (%)", "Energy (MJ/kg)"),
+        labels: tuple = ("Cost (€/MT)", "Lysine (%)", "Energy (MJ/kg)"),
         ref_point: Union[np.ndarray, torch.Tensor, None] = None,
         show_projection: bool = True,
         angle: tuple = (25, 45),
