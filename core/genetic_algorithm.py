@@ -10,7 +10,11 @@ from pymoo.core.problem import Problem
 from pymoo.operators.sampling.rnd import FloatRandomSampling
 from pymoo.operators.sampling.lhs import LHS
 from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
+from pymoo.indicators.hv import Hypervolume  # 用于超体积计算
 from typing import Tuple
+
+from scipy.stats import pareto
+
 from core.hybrid_strategy import HybridStrategy
 
 
@@ -70,7 +74,7 @@ class DirichletSampling(FloatRandomSampling):
 
 
 class FeedProblem(Problem):
-    def __init__(self, evaluator, n_var=17):
+    def __init__(self, evaluator, n_var=17, config_path="configs/ga_config.yaml"):
         """
         饲料配方优化问题定义 (与FeedEvaluator完全兼容)
 
@@ -96,11 +100,18 @@ class FeedProblem(Problem):
         self.ga_history = []
         self.best_solutions = []
         self.raw_objectives = None  # 存储原始目标值
+        with open(config_path) as f:
+            config = yaml.safe_load(f)
+        self.ref_point = torch.tensor(
+            config['ref_point'],
+            dtype=torch.float32
+        )
+
 
     def _evaluate(self, X, out, *args, **kwargs):
         # 转换为PyTorch张量
         pop = self.repair.do(self, Population.new(X=X))
-        X_tensor = torch.tensor(pop.get("X"), device=self.evaluator.device, dtype=self.precision,)
+        X_tensor = torch.tensor(pop.get("X"), device=self.evaluator.device, dtype=self.precision)
 
         # 计算约束违反量（正值表示违反）
         with torch.no_grad():
@@ -139,8 +150,8 @@ class FeedProblem(Problem):
         # 统一为最小化问题（使用倒数处理最大化目标）
         out["F"] = torch.stack([
             objectives[:, 0],  # 成本（最小化）
-            1.0 / (objectives[:, lysin_idx] + 1e-10),  # 赖氨酸最大化转为最小化
-            1.0 / (objectives[:, energy_idx] + 1e-10)  # 能量最大化转为最小化
+            -objectives[:, lysin_idx],  # 赖氨酸最大化 → 最小化负值
+            -objectives[:, energy_idx]  # 能量最大化 → 最小化负值
         ], dim=1).cpu().numpy()
 
         self._update_best_solutions(out)
@@ -152,20 +163,33 @@ class FeedProblem(Problem):
 
     def _update_best_solutions(self, out):
         """更新历史最优解集"""
-        feasible_mask = (out["G"] <= 1e-6).all(axis=1)  # 可行解需满足所有约束
+        G_np = out["G"] if isinstance(out["G"], np.ndarray) else out["G"].cpu().numpy()
+        feasible_mask = (G_np <= 1e-6).all(axis=1)  # 可行解需满足所有约束
         if np.any(feasible_mask):
-            # 选择可行解中成本最低的
-            best_idx = np.argmin(out["F"][feasible_mask, 0])
-            self.best_solutions.append(self.raw_objectives[feasible_mask][best_idx].cpu().numpy())
+            # 情况1：存在可行解
+            if isinstance(out["F"], torch.Tensor):
+                # 如果F是PyTorch张量，使用PyTorch操作
+                feasible_F = out["F"][feasible_mask, 0]
+                best_idx = torch.argmin(feasible_F).item()
+                best_solution = self.raw_objectives[feasible_mask][best_idx]
+            else:
+                # 如果F是NumPy数组，使用NumPy操作
+                feasible_F = out["F"][feasible_mask, 0]
+                best_idx = np.argmin(feasible_F)
+                best_solution = self.raw_objectives[feasible_mask][best_idx]
         else:
-            # 若无可行解，选择总违反量最小的
-            total_violation = np.sum(np.maximum(out["G"], 0), axis=1)
+            # 情况2：无可行解，选择约束违反最小的
+            total_violation = np.sum(np.maximum(G_np, 0), axis=1)
             best_idx = np.argmin(total_violation)
-            self.best_solutions.append(self.raw_objectives[best_idx].cpu().numpy())
+            best_solution = self.raw_objectives[best_idx]
+
+        self.best_solutions.append(best_solution.cpu().numpy())
 
 
     def _debug_output(self, X_tensor, out):
-        fronts = NonDominatedSorting().do(out["F"])
+        F_np = out["F"] if isinstance(out["F"], np.ndarray) else out["F"].cpu().numpy()
+
+        fronts = NonDominatedSorting().do(F_np)
         if len(fronts[0]) > 0:
             pf_indices = fronts[0]
             pf_objectives = self.raw_objectives[pf_indices].cpu().numpy()
@@ -225,8 +249,9 @@ def run_ga(
             eta=config['mutation']['eta']
         ),
         eliminate_duplicates=True,
+        save_history=True,  # 启用历史记录
         repair=NormalizationRepair(problem.xu),  # 注入修复算子
-        constraints_handling="adaptive_penalty"  # 自适应约束处理
+        constraints_handling="death_penalty"  # 自适应约束处理
     )
 
     # 运行优化
@@ -260,36 +285,82 @@ def run_ga(
     if hasattr(problem, 'raw_objectives'):
         print("\n最终结果验证:")
         best_idx = torch.argmin(F[:, 0])  # 选择成本最低的解
-        best_X = population[best_idx] if len(population) > 0 else X[best_idx]
-
-        # 验证约束
-        ingredient_lower_viol = (evaluator.ingredient_lower_bounds - best_X).clamp(min=0)
-        ingredient_upper_viol = (best_X - evaluator.ingredient_upper_bounds).clamp(min=0)
-        nutrient_values = best_X @ evaluator.nutrition
-        nutrient_lower_viol = (evaluator.lower_bounds - nutrient_values).clamp(min=0)
-        nutrient_upper_viol = (nutrient_values - evaluator.upper_bounds).clamp(min=0)
-        sum_viol = torch.abs(best_X.sum() - 1.0)
-
-        print(f"- 原料下限违反量: {ingredient_lower_viol.max().item():.2e}")
-        print(f"- 原料上限违反量: {ingredient_upper_viol.max().item():.2e}")
-        print(f"- 营养下限违反量: {nutrient_lower_viol.max().item():.2e}")
-        print(f"- 营养上限违反量: {nutrient_upper_viol.max().item():.2e}")
-        print(f"- 总和约束违反量: {sum_viol.item():.2e}")
 
         print("\n最优解:")
         print(f"- 成本: {F[best_idx, 0].item():.2f} €/MT")
         print(f"- 赖氨酸: {F[best_idx, 1].item():.3f}%")
         print(f"- 能量: {F[best_idx, 2].item():.2f} MJ/kg")
-    # 在run_ga函数最后添加：
-    best_idx = torch.argmin(F[:, 0])  # 确保使用相同的选择标准
-    best_solution = {
-        "Cost": F[best_idx, 0].item(),
-        "Lysine": F[best_idx, 1].item(),
-        "Energy": F[best_idx, 2].item()
-    }
-    print("\nFinal Best Solution:")
-    print(f"- Cost: {best_solution['Cost']:.2f} €/MT")
-    print(f"- Lysine: {best_solution['Lysine']:.3f}%")
-    print(f"- Energy: {best_solution['Energy']:.2f} MJ/kg")
 
-    return X, F, population, problem.best_solutions
+
+    # 新增: 计算每代的超体积历史
+    hv_history = []
+    if hasattr(res, 'history'):
+        for gen_idx, record in enumerate(res.history):
+            if gen_idx % 5 == 0 and hasattr(record, 'pop'):
+                # 获取当前代的X值
+                X_gen = torch.tensor(record.pop.get("X"), dtype=torch.float32, device=evaluator.device)
+
+                # 重新计算原始目标值（确保使用正确的方向）
+                objectives = evaluator(X_gen)
+                nutrient_names = evaluator.get_nutrient_names()
+                lysin_idx = 1 + nutrient_names.index('L')
+                energy_idx = 1 + nutrient_names.index('Energy')
+
+                # 构建原始目标矩阵 [成本, 赖氨酸, 能量]
+                F_gen = torch.stack([
+                    objectives[:, 0],  # 成本（最小化）
+                    objectives[:, lysin_idx],  # 赖氨酸（最大化）
+                    objectives[:, energy_idx]  # 能量（最大化）
+                ], dim=1)
+
+                def compute_hypervolume(F, ref_point):
+                    """修正后的HV计算函数"""
+                    # 1. 转换为numpy数组
+                    F_np = F.cpu().numpy() if isinstance(F, torch.Tensor) else F.copy()
+
+                    # 2. 统一目标方向（所有目标转为最小化）
+                    # 注意：成本已经是最小化，只需转换赖氨酸和能量
+                    F_np[:, 1:] = -F_np[:, 1:]  # 最大化目标取负
+
+                    # 3. 调整参考点（与目标方向一致）
+                    hv_ref_point = np.array([
+                        ref_point[0],  # 成本（最小化）
+                        -ref_point[1],  # 赖氨酸（转为最小化）
+                        -ref_point[2]  # 能量（转为最小化）
+                    ])
+
+                    # 4. 计算非支配前沿
+                    nds = NonDominatedSorting()
+                    front_indices = nds.do(F_np, only_non_dominated_front=True)
+
+                    # 5. 计算HV（仅使用非支配解）
+                    if len(front_indices) > 0:
+                        hv_calculator = Hypervolume(ref_point=hv_ref_point)
+                        return hv_calculator(F_np[front_indices])
+                    return 0.0
+
+                # 使用配置的参考点计算HV
+                hv_val = compute_hypervolume(F_gen, problem.ref_point.cpu().numpy())
+                hv_history.append((gen_idx, hv_val))
+
+                # 调试输出
+                print(f"Generation {gen_idx}: HV = {hv_val:.4f}")
+
+    # 计算HV改进量（基于最近5代的平均值）
+    window_size = 5
+    hv_improvement = 0.0
+    if len(hv_history) >= window_size:
+        recent_hv = [hv for _, hv in hv_history[-window_size:]]
+        hv_improvement = (recent_hv[-1] - recent_hv[0]) / window_size
+
+    # 提取纯HV值列表（按代数排序）
+    sorted_hv_history = sorted(hv_history, key=lambda x: x[0])
+    hv_values = [hv for _, hv in sorted_hv_history]
+
+    # 返回结果
+    return X, F, population, {
+        "best_solutions": problem.best_solutions,
+        "hv_history": hv_values,
+        "hv_improvement": max(hv_improvement, 0),  # 确保非负
+        "population_F": torch.tensor(res.pop.get("F"), dtype=torch.float32)
+    }

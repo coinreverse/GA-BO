@@ -1,5 +1,4 @@
 import torch
-import numpy as np
 from typing import Dict, Any
 import yaml
 from core.genetic_algorithm import run_ga
@@ -45,11 +44,14 @@ def main():
     # 阶段1: GA全局探索
     print("\n=== Phase 1: Genetic Algorithm Exploration ===")
 
-    X_ga, Y_ga, ga_population, ga_history = run_ga(
+    X_ga, Y_ga, ga_population, ga_metadata = run_ga(
         evaluator=evaluator,
         config_path="configs/ga_config.yaml",
     )
 
+    # 提取切换判断所需数据
+    ga_population = ga_metadata["population_F"]  # (n_samples, 3) 目标值矩阵
+    ga_hv_history = ga_metadata["hv_history"]  # 超体积历史列表
     # 可视化GA结果
     fig_ga = plot_pareto_front(
         Y_ga,
@@ -63,66 +65,43 @@ def main():
     # 自适应切换决策
     # if False:
     if strategy.should_switch_to_bo(
-            ga_history=ga_history,
-            ga_population=ga_population if ga_population.numel() > 0 else None,
-            window=hybrid_config['window_size'],
-            tol=hybrid_config['improvement_tol'],
-            min_iter=hybrid_config['min_ga_iter']
+            ga_hv_history=ga_hv_history,
+            ga_population=ga_population,
     ):
         # 阶段2: BO局部开发
         print("\n=== Phase 2: Bayesian Optimization Refinement ===")
 
-        # 1. 清洗GA结果
-        def clean_ga_results(Y_ga, max_threshold=1e6):
-            """剔除超出阈值的异常解"""
-            # 确保使用PyTorch操作（如果Y_ga是torch.Tensor）
-            if isinstance(Y_ga, torch.Tensor):
-                # 先统一目标方向
-                Y_adjusted = Y_ga.clone()
-                Y_adjusted[:, 0] = -Y_adjusted[:, 0]  # 成本取反
-
-                # 剔除异常值
-                valid_mask = torch.all(Y_adjusted < max_threshold, dim=1)
-                return X_ga[valid_mask], Y_ga[valid_mask]
-            else:
-                valid_mask = np.all(Y_ga < max_threshold, axis=1)
-                return X_ga[valid_mask], Y_ga[valid_mask]
-
-        X_ga_clean, Y_ga_clean = clean_ga_results(Y_ga.cpu().numpy() if torch.is_tensor(Y_ga) else Y_ga)
-
         # 转换为张量（如果需要）
-        if not isinstance(X_ga_clean, torch.Tensor):
-            X_ga_clean = torch.tensor(X_ga_clean, dtype=torch.float32)
-        if not isinstance(Y_ga_clean, torch.Tensor):
-            Y_ga_clean = torch.tensor(Y_ga_clean, dtype=torch.float32)
+        if not isinstance(X_ga, torch.Tensor):
+            X_ga = torch.tensor(X_ga, dtype=torch.double)
+        if not isinstance(Y_ga, torch.Tensor):
+            Y_ga = torch.tensor(Y_ga, dtype=torch.double)
 
         # 准备BO初始样本
-        X_init = strategy.initialize_bo(
-            (X_ga_clean, Y_ga_clean),
+        X_init, Y_init = strategy.initialize_bo(
+            ga_results=(X_ga, Y_ga),
+            evaluator=evaluator,
             n_samples=bo_config['raw_samples'],
             noise_scale=hybrid_config['noise_scale'],
         )
-        Y_init = evaluator(X_init)
-        Y_init = np.clip(Y_init.cpu().numpy(), 0, 1e4)  # 硬截断
-
         # 运行BO优化
         bo = BOOptimizer(
             bounds=feed_config['ingredient_bounds'],  # 直接传入边界字典
             ref_point=ref_point,
-            acqf_config=bo_config.get('acqf_params', {})
         )
         nutrient_names = evaluator.get_nutrient_names()
         X_hybrid, Y_hybrid = bo.optimize(
             X_init=X_init,
-            Y_init=Y_init[:, [0, 1 + nutrient_names.index('L'), 1 + nutrient_names.index('Energy')]],
+            Y_init=Y_init,
             n_iter=bo_config['n_iter'],
             batch_size=bo_config['batch_size'],
             evaluator=lambda x: evaluator(x)[:, [0, 1 + nutrient_names.index('L'), 1 + nutrient_names.index('Energy')]]
         )
-
-        # 合并GA和BO结果
+        #
+        # # 合并GA和BO结果
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         X_hybrid = torch.cat([X_ga, X_hybrid])
-        Y_hybrid = torch.cat([Y_ga, Y_hybrid])
+        Y_hybrid = torch.cat([Y_ga.to(device), Y_hybrid.to(device)])
     else:
         print("GA optimization sufficient, skipping BO phase")
         X_hybrid, Y_hybrid = X_ga, Y_ga

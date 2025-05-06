@@ -4,6 +4,7 @@ from botorch.models import SingleTaskGP
 from botorch.fit import fit_gpytorch_mll
 from botorch.acquisition import qLogExpectedImprovement
 from botorch.acquisition.objective import LinearMCObjective
+from botorch.models.transforms import Normalize
 from botorch.optim import optimize_acqf
 from botorch.models.transforms.outcome import Standardize
 from botorch.utils.multi_objective.box_decompositions.dominated import DominatedPartitioning
@@ -16,7 +17,6 @@ class BOOptimizer:
             self,
             bounds: Dict[str, List[float]],
             ref_point: Optional[torch.Tensor] = None,
-            acqf_config: Optional[Dict] = None,
             device: str = "cuda" if torch.cuda.is_available() else "cpu"
     ):
         """
@@ -29,7 +29,8 @@ class BOOptimizer:
             device: 计算设备
         """
         self.device = torch.device(device)
-        self.precision = torch.float32
+        print(f"Optimizer initialized on device: {self.device}")  # 调试信息
+        self.precision = torch.double
         self.bounds = torch.tensor(
             [bounds['lower'], bounds['upper']],
             device=self.device,
@@ -42,30 +43,11 @@ class BOOptimizer:
 
         # 默认目标权重（可根据实际情况调整）
         self.default_weights = torch.tensor([-1.0, 1.0, 1.0], device=self.device, dtype=torch.double)
-        # 允许通过acqf_config覆盖默认权重
-        if acqf_config and 'weights' in acqf_config:
-            self.default_weights = torch.tensor(
-                acqf_config['weights'],
-                device=self.device,
-                dtype=torch.double
-            )
 
         # 优化状态
         self._X = None
         self._Y = None
         self._model = None
-        # 添加Turbo相关参数
-        self.tr_hparams = {
-            'length_init': 0.8,
-            'length_min': 0.01,
-            'length_max': 1.6,
-            'success_streak': 3,
-            'failure_streak': 3,
-            'winsor_pct': 5.0,
-            'max_tr_size': 2000,
-            'min_tr_size': 50,
-            'eps': 1e-3
-        }
 
     def optimize(
             self,
@@ -89,19 +71,16 @@ class BOOptimizer:
         Returns:
             优化后的解和目标值
         """
-        # 确保输入是 PyTorch 张量
-        if not isinstance(Y_init, torch.Tensor):
-            Y_init = torch.tensor(Y_init, dtype=self.precision, device=self.device)
-        else:
-            Y_init = Y_init.to(dtype=self.precision, device=self.device)
 
-        # 确保 X_init 也是 PyTorch 张量
-        if not isinstance(X_init, torch.Tensor):
-            X_init = torch.tensor(X_init, dtype=self.precision, device=self.device)
-        else:
-            X_init = X_init.to(dtype=self.precision, device=self.device)
+        # 确保数据是双精度并位于正确设备
+        self._X = X_init.to(device=self.device, dtype=torch.double)
+        self._Y = Y_init.to(device=self.device, dtype=torch.double)
 
-        self.initialize(X_init, Y_init)
+        # 确保边界也是双精度
+        self.bounds = self.bounds.to(dtype=torch.double)
+
+        # 初始化模型
+        self._update_model()
 
         X_candidates = []
         Y_candidates = []
@@ -111,18 +90,10 @@ class BOOptimizer:
             candidates = self.get_next_candidate(batch_size=batch_size)
 
             # 评估候选点
-            if evaluator is not None:
-                Y_new = evaluator(candidates)
-            else:
-                # 如果没有提供评估器，使用最近邻近似
-                _, indices = torch.cdist(candidates, self._X).min(dim=1)
-                Y_new = self._Y[indices]
-
-            # 确保新数据是双精度
-            Y_new = Y_new.to(dtype=self.precision, device=self.device)
+            Y_new = evaluator(candidates) if evaluator else self._Y[torch.cdist(candidates, self._X).argmin(dim=1)]
 
             # 更新数据集
-            self.update(candidates, Y_new)
+            self.update(candidates, Y_new.to(dtype=torch.double))
 
             X_candidates.append(candidates)
             Y_candidates.append(Y_new)
@@ -133,37 +104,33 @@ class BOOptimizer:
 
         return X_opt, Y_opt
 
-    def initialize(self, X: torch.Tensor, Y: torch.Tensor):
-        """初始化观测数据"""
-        self._X = X.to(device=self.device, dtype=torch.double)
-        self._Y = Y.to(device=self.device, dtype=torch.double)
-        if torch.any(torch.isnan(self._Y)) or torch.any(torch.isinf(self._Y)):
-            raise ValueError("Y contains invalid values (NaN or Inf)")
-        self._update_model()
 
     def _update_model(self):
         """更新高斯过程模型"""
-        # 添加数值检查
-        if torch.any(torch.isnan(self._Y)) or torch.any(torch.isinf(self._Y)):
-            raise ValueError("Y contains NaN or Inf values")
-
         train_Y = self._Y.clone()
         # 创建模型
         self._model = SingleTaskGP(
             self._X,
             train_Y,
+            input_transform=Normalize(d=self._X.shape[-1]),
             outcome_transform=Standardize(m=train_Y.shape[-1])  # 添加标准化转换
         )
 
-        # 设置更强的噪声约束
+        # 设置噪声约束
+        y_std = self._Y.std()
+        noise_lb = max(1e-4, y_std * 1e-3)  # 至少1e-4，或Y标准差的0.1%
         self._model.likelihood.noise_covar.register_constraint(
             "raw_noise",
-            gpytorch.constraints.GreaterThan(1e-4)
+            gpytorch.constraints.GreaterThan(noise_lb)
         )
 
         # 添加模型训练参数
         mll = ExactMarginalLogLikelihood(self._model.likelihood, self._model)
-        fit_gpytorch_mll(mll)
+        fit_gpytorch_mll(
+            mll,
+            max_retries=3,  # 失败时重试
+            max_iter=100,  # 增加迭代次数
+        )
 
     def get_next_candidate(self, batch_size: int = 1) -> torch.Tensor:
         if self._model is None:
@@ -175,7 +142,7 @@ class BOOptimizer:
             # 使用超体积改进作为目标
             partitioning = DominatedPartitioning(
                 ref_point=self.ref_point,
-                Y=Y_normalized
+                Y=self._Y
             )
             best_f = partitioning.compute_hypervolume()
         else:

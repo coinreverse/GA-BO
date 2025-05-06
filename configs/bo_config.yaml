@@ -6,11 +6,6 @@ num_restarts: 20             # 优化重启次数
 raw_samples: 512             # 初始采样数
 hv_improve_tol: 1e-4         # HV改进容忍度
 
-# 采集函数参数
-acqf_params:
-  xi: 0.01                   # 探索系数
-  beta: 0.2                  # 置信区间系数
-  maximize: True             # 是否最大化目标
 
 # 模型参数
 model:

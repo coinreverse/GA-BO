@@ -1,5 +1,4 @@
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 import numpy as np
 import torch
 from typing import Union
@@ -114,34 +113,3 @@ def plot_pareto_front(
 
     plt.tight_layout()
     return fig
-
-
-# 使用示例
-if __name__ == "__main__":
-    # 生成模拟数据
-    np.random.seed(42)
-    cost = np.random.uniform(2.5, 5.0, 100)
-    lysine = np.random.uniform(0.6, 1.0, 100)
-    energy = np.random.uniform(12.0, 15.0, 100)
-    Y = np.column_stack([cost, lysine, energy])
-
-    # 添加帕累托前沿点
-    Y[:7, :] = np.array([
-        [2.8, 0.65, 13.0],
-        [3.0, 0.72, 13.5],
-        [3.2, 0.78, 14.0],
-        [3.5, 0.85, 14.2],
-        [4.0, 0.92, 14.5],
-        [4.5, 0.95, 14.8],
-        [5.0, 1.00, 15.0]
-    ])
-
-    # 绘制图表
-    ref_point = np.array([5.5, 0.5, 11.0])
-    fig = plot_pareto_front(
-        Y,
-        title="Feed Formula Optimization",
-        ref_point=ref_point,
-        angle=(30, 40)
-    )
-    plt.show()

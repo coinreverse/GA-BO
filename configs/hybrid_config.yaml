@@ -1,4 +1,4 @@
-ref_point: [190, 0.0, 0.0]  # 成本上限, 赖氨酸下限, 能量下限
+ref_point: [180, 0.9, 14.0] # 成本上限, 赖氨酸下限, 能量下限
 window_size: 5
 improvement_tol: 0.01
 min_ga_iter: 10
