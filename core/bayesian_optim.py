@@ -36,10 +36,7 @@ class BOOptimizer:
             device=self.device,
             dtype=self.precision
         )
-        if ref_point is not None:
-            self.ref_point = ref_point.to(device=self.device, dtype=torch.double)
-        else:
-            self.ref_point = None
+        self.ref_point = ref_point.to(device=self.device, dtype=torch.double)
 
         # 默认目标权重（可根据实际情况调整）
         self.default_weights = torch.tensor([-1.0, 1.0, 1.0], device=self.device, dtype=torch.double)
@@ -56,7 +53,6 @@ class BOOptimizer:
             n_iter: int = 20,
             batch_size: int = 1,
             evaluator=None,
-            **kwargs
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         执行贝叶斯优化
@@ -88,32 +84,32 @@ class BOOptimizer:
         for _ in range(n_iter):
             # 获取下一批候选点
             candidates = self.get_next_candidate(batch_size=batch_size)
+            print("-----------------------",candidates)
 
             # 评估候选点
             Y_new = evaluator(candidates) if evaluator else self._Y[torch.cdist(candidates, self._X).argmin(dim=1)]
+            print("=========================",Y_new)
 
-            # 更新数据集
-            self.update(candidates, Y_new.to(dtype=torch.double))
+            # 过滤无效解
+            valid_mask = (Y_new[:, 0] < 1e5)  # 只保留有效解
+            if valid_mask.any():  # 如果有有效解才更新
+                self.update(candidates[valid_mask], Y_new[valid_mask].to(dtype=torch.double))
+                X_candidates.append(candidates[valid_mask])
+                Y_candidates.append(Y_new[valid_mask])
+            else:
+                print("Warning: 本批次所有候选解均无效")
 
-            X_candidates.append(candidates)
-            Y_candidates.append(Y_new)
 
-        # 合并结果
-        X_opt = torch.cat([self._X] + X_candidates)
-        Y_opt = torch.cat([self._Y] + Y_candidates)
-
-        return X_opt, Y_opt
+        return self._X, self._Y
 
 
     def _update_model(self):
         """更新高斯过程模型"""
-        train_Y = self._Y.clone()
-        # 创建模型
         self._model = SingleTaskGP(
             self._X,
-            train_Y,
+            self._Y,
             input_transform=Normalize(d=self._X.shape[-1]),
-            outcome_transform=Standardize(m=train_Y.shape[-1])  # 添加标准化转换
+            outcome_transform=Standardize(m=self._Y.shape[-1])
         )
 
         # 设置噪声约束
@@ -136,34 +132,34 @@ class BOOptimizer:
         if self._model is None:
             raise RuntimeError("Model not initialized. Call initialize() first.")
 
-        Y_normalized = (self._Y - self._Y.mean(0)) / (self._Y.std(0) + 1e-6)
-        # 改进最佳值选择
-        if Y_normalized.shape[1] > 1:  # 多目标情况
-            # 使用超体积改进作为目标
+        # 只使用有效解计算参考点（过滤掉惩罚值）
+        valid_mask = (self._Y[:, 0] < 1e5)
+        if not valid_mask.any():
+            # 无有效解时退回随机采样
+            return torch.rand(batch_size, self.bounds.shape[1],
+                              device=self.device, dtype=self.precision)
+
+        Y_valid = self._Y[valid_mask]
+        Y_normalized = (Y_valid - Y_valid.mean(0)) / (Y_valid.std(0) + 1e-6)
+
+        # 多目标处理（使用有效解）
+        if Y_normalized.shape[1] > 1:
             partitioning = DominatedPartitioning(
-                ref_point=self.ref_point,
-                Y=self._Y
+                ref_point=self.ref_point.to(dtype=self.precision),
+                Y=Y_valid
             )
             best_f = partitioning.compute_hypervolume()
+            weights = torch.ones(Y_normalized.shape[1], device=self.device, dtype=self.precision)
+            objective = LinearMCObjective(weights)
         else:
             best_f = Y_normalized.max()
-
-        # 根据输出维度自动调整目标函数
-        if Y_normalized.shape[1] > 1:  # 多目标情况
-            if not hasattr(self, 'default_weights') or len(self.default_weights) != Y_normalized.shape[1]:
-                self.default_weights = torch.ones(
-                    Y_normalized.shape[1],
-                    device=self.device,
-                    dtype=torch.double
-                )
-            objective = LinearMCObjective(self.default_weights)
-        else:  # 单目标情况
             objective = None
 
-        acqf = qLogExpectedImprovement(  # 使用改进的LogEI
+        # 生成候选点
+        acqf = qLogExpectedImprovement(
             model=self._model,
             best_f=best_f,
-            objective=objective  # 传入目标函数
+            objective=objective
         )
 
         candidates, _ = optimize_acqf(
@@ -172,10 +168,13 @@ class BOOptimizer:
             q=batch_size,
             num_restarts=10,
             raw_samples=512,
-            options={"batch_limit": 5, "maxiter": 200}
+            options={"batch_limit": 5}
         )
-        # 添加边界检查
-        candidates = torch.clamp(candidates, min=self.bounds[0], max=self.bounds[1])
+
+        # 强制满足约束
+        candidates = candidates.clamp(min=self.bounds[0], max=self.bounds[1])
+        candidates = candidates / candidates.sum(dim=1, keepdim=True)  # 归一化总和
+
         return candidates.detach()
 
     def update(self, X_new: torch.Tensor, Y_new: torch.Tensor):

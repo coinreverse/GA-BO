@@ -85,7 +85,7 @@ class FeedProblem(Problem):
         # 约束总数 = 1(总和) + 17(原料下限) + 17(原料上限) + 10(营养下限) + 10(营养上限) = 55
         super().__init__(
             n_var=n_var,
-            n_obj=3,  # 成本、赖氨酸、能量
+            n_obj=11,  # 成本、营养
             n_constr=55,
             xl=np.zeros(n_var),
             xu=evaluator.ingredient_upper_bounds.cpu().numpy()
@@ -107,11 +107,15 @@ class FeedProblem(Problem):
             dtype=torch.float32
         )
 
-
     def _evaluate(self, X, out, *args, **kwargs):
         # 转换为PyTorch张量
         pop = self.repair.do(self, Population.new(X=X))
         X_tensor = torch.tensor(pop.get("X"), device=self.evaluator.device, dtype=self.precision)
+
+        # 计算原始目标值（含惩罚值）
+        objectives = self.evaluator(X_tensor)
+        # 检查解是否有效（是否被施加了惩罚值）
+        is_valid = (objectives[:, 0] < self.evaluator.penalty_value * 0.9)  # 假设惩罚值为1e6
 
         # 计算约束违反量（正值表示违反）
         with torch.no_grad():
@@ -126,38 +130,28 @@ class FeedProblem(Problem):
 
             # 合并所有约束（总和约束 + 原料 + 营养）
             sum_viol = torch.abs(X_tensor.sum(dim=1) - 1.0).unsqueeze(1)
-            out["G"] = torch.cat([
-                sum_viol,
-                ingredient_lower_viol,
-                ingredient_upper_viol,
-                nutrient_lower_viol,
-                nutrient_upper_viol
-            ], dim=1).cpu().numpy()
+            G = torch.cat([sum_viol, ingredient_lower_viol, ingredient_upper_viol,
+                           nutrient_lower_viol, nutrient_upper_viol], dim=1)
 
-        # 3. 计算目标函数（统一为最小化）
-        objectives = self.evaluator(X_tensor)
-        nutrient_names = self.evaluator.get_nutrient_names()
-        lysin_idx = 1 + nutrient_names.index('L')
-        energy_idx = 1 + nutrient_names.index('Energy')
+            # 对无效解施加额外约束违反惩罚
+            F_processed = torch.cat([
+                objectives[:, 0].unsqueeze(1),  # 成本
+                -objectives[:, 1:11]  # 营养指标（取负）
+            ], dim=1)
+
+            # 无效解的目标值设为极大值，约束违反量也设为极大值
+            F_processed[~is_valid, :] = 1e6  # 统一惩罚
+            G[~is_valid, :] = 1e6  # 替代原来的 += 1e6
+
+            out["F"] = F_processed.cpu().numpy()
+            out["G"] = G.cpu().numpy()
 
         # 保存原始目标值
-        self.raw_objectives = torch.stack([
-            objectives[:, 0],  # 成本（最小化）
-            objectives[:, lysin_idx],  # 赖氨酸（最大化）
-            objectives[:, energy_idx]  # 能量（最大化）
-        ], dim=1)
-
-        # 统一为最小化问题（使用倒数处理最大化目标）
-        out["F"] = torch.stack([
-            objectives[:, 0],  # 成本（最小化）
-            -objectives[:, lysin_idx],  # 赖氨酸最大化 → 最小化负值
-            -objectives[:, energy_idx]  # 能量最大化 → 最小化负值
-        ], dim=1).cpu().numpy()
-
+        self.raw_objectives = objectives
         self._update_best_solutions(out)
 
         if self.current_gen % 5 == 0:
-            self._debug_output(X_tensor, out)
+            self._debug_output(out)
 
         self.current_gen += 1
 
@@ -185,8 +179,7 @@ class FeedProblem(Problem):
 
         self.best_solutions.append(best_solution.cpu().numpy())
 
-
-    def _debug_output(self, X_tensor, out):
+    def _debug_output(self, out):
         F_np = out["F"] if isinstance(out["F"], np.ndarray) else out["F"].cpu().numpy()
 
         fronts = NonDominatedSorting().do(F_np)
@@ -194,10 +187,17 @@ class FeedProblem(Problem):
             pf_indices = fronts[0]
             pf_objectives = self.raw_objectives[pf_indices].cpu().numpy()
 
+            # 获取营养素名称和对应索引
+            nutrient_names = self.evaluator.get_nutrient_names()
+            energy_idx = nutrient_names.index('Energy')
+            lysine_idx = nutrient_names.index('L')
+
             print("\n当前帕累托前沿:")
             print(f"- 成本范围: {pf_objectives[:, 0].min():.2f} ~ {pf_objectives[:, 0].max():.2f} €/MT")
-            print(f"- 赖氨酸范围: {pf_objectives[:, 1].min():.3f} ~ {pf_objectives[:, 1].max():.3f}%")
-            print(f"- 能量范围: {pf_objectives[:, 2].min():.2f} ~ {pf_objectives[:, 2].max():.2f} MJ/kg")
+            print(
+                f"- 赖氨酸范围: {pf_objectives[:, lysine_idx + 1].min():.3f} ~ {pf_objectives[:, lysine_idx + 1].max():.3f}%")
+            print(
+                f"- 能量范围: {pf_objectives[:, energy_idx + 1].min():.2f} ~ {pf_objectives[:, energy_idx + 1].max():.2f} MJ/kg")
 
             # 检查约束满足情况
             max_violation = out["G"][pf_indices].max(axis=1)
@@ -266,31 +266,35 @@ def run_ga(
     # 获取最优解集
     X = torch.tensor(res.X, dtype=torch.float32, device=evaluator.device)
 
-    # 后处理 - 使用原始目标值而不是转换后的值
-    if hasattr(problem, 'raw_objectives'):
-        F = problem.raw_objectives.cpu()
-    else:
-        F = torch.tensor(res.F, dtype=torch.float32, device=evaluator.device)
-        # 尝试恢复原始值（如果使用了转换）
-        F[:, 1] = 1.0 / (F[:, 1] + 1e-10)  # 赖氨酸
-        F[:, 2] = 1.0 / (F[:, 2] + 1e-10)  # 能量
-
-    # 确保成本为正
-    F[:, 0] = torch.abs(F[:, 0])
-
+    F = problem.raw_objectives.cpu()
+    # 过滤无效解（惩罚值超过阈值）
+    valid_mask = F[:, 0] < evaluator.penalty_value * 0.9  # 假设惩罚值为1e6
+    X_valid = X[valid_mask]
+    F_valid = F[valid_mask]
+    # 如果无有效解，返回约束违反最小的解
+    if len(X_valid) == 0:
+        print("警告：无完全可行解，返回约束违反最小的解")
+        G = torch.tensor(res.G, dtype=torch.float32)
+        total_violation = G.sum(dim=1)
+        best_idx = torch.argmin(total_violation)
+        X_valid = X[best_idx].unsqueeze(0)
+        F_valid = F[best_idx].unsqueeze(0)
     # 获取最终种群
-    population = torch.tensor(res.pop.get("X"), dtype=torch.float32, device=evaluator.device) if hasattr(res, 'pop') else torch.tensor([])
+    population = torch.tensor(res.pop.get("X"), dtype=torch.float32, device=evaluator.device) if hasattr(res,
+                                                                                                         'pop') else torch.tensor(
+        [])
 
     # 检查约束满足情况
     if hasattr(problem, 'raw_objectives'):
         print("\n最终结果验证:")
         best_idx = torch.argmin(F[:, 0])  # 选择成本最低的解
-
+        nutrient_names = evaluator.get_nutrient_names()
+        energy_idx = nutrient_names.index('Energy')
+        lysine_idx = nutrient_names.index('L')
         print("\n最优解:")
         print(f"- 成本: {F[best_idx, 0].item():.2f} €/MT")
-        print(f"- 赖氨酸: {F[best_idx, 1].item():.3f}%")
-        print(f"- 能量: {F[best_idx, 2].item():.2f} MJ/kg")
-
+        print(f"- 赖氨酸: {F[best_idx, 1 + lysine_idx].item():.3f}%")
+        print(f"- 能量: {F[best_idx, 1 + energy_idx].item():.2f} MJ/kg")
 
     # 新增: 计算每代的超体积历史
     hv_history = []
@@ -358,7 +362,7 @@ def run_ga(
     hv_values = [hv for _, hv in sorted_hv_history]
 
     # 返回结果
-    return X, F, population, {
+    return X_valid, F_valid, population, {
         "best_solutions": problem.best_solutions,
         "hv_history": hv_values,
         "hv_improvement": max(hv_improvement, 0),  # 确保非负

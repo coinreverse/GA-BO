@@ -122,12 +122,10 @@ class HybridStrategy:
     def initialize_bo(
             self,
             ga_results: Tuple[torch.Tensor, torch.Tensor],
-            evaluator,
             n_samples: int = 30,
-            noise_scale: float = 0.05,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        混合策略BO初始化：帕累托前沿 + 各目标最优解 + 多样性补充
+        混合策略BO初始化：帕累托前沿 + 各目标最优解
 
         Args:
             evaluator: 评估扰动样本
@@ -156,23 +154,17 @@ class HybridStrategy:
         print(f"保留帕累托解: {len(pareto_X)}个")
 
         # 2. 添加各目标方向的最优解（即使被支配）
-        objective_directions = [
-            (0, False),  # 成本最小化
-            (1, True),  # 赖氨酸最大化
-            (2, True)  # 能量最大化
-        ]
-
-        for obj_idx, is_maximize in objective_directions:
-            if is_maximize:
-                idx = torch.argmax(Y_ga[:, obj_idx])
-            else:
+        # 第0列是成本（最小化），其他列是最大化
+        for obj_idx in range(Y_ga.shape[1]):
+            if obj_idx == 0:  # 成本最小化
                 idx = torch.argmin(Y_ga[:, obj_idx])
+            else:  # 其他目标最大化
+                idx = torch.argmax(Y_ga[:, obj_idx])
 
-            # 检查是否已在帕累托解中
             if not pareto_mask[idx]:
                 x_samples.append(X_ga[idx].unsqueeze(0))
                 y_samples.append(Y_ga[idx].unsqueeze(0))
-                print(f"添加{['成本', '赖氨酸', '能量'][obj_idx]}最优解 (被支配)")
+                print(f"添加第{obj_idx}个目标最优解 (被支配)")
 
         # 3. 添加被支配解中成本最低的5个解（确保成本敏感）
         non_pareto_mask = ~pareto_mask
@@ -187,46 +179,6 @@ class HybridStrategy:
         # 合并已有样本
         X_combined = torch.cat(x_samples, dim=0) if x_samples else torch.rand(n_samples, X_ga.shape[1], device=device)
         Y_combined = torch.cat(y_samples, dim=0) if y_samples else torch.zeros(n_samples, Y_ga.shape[1], device=device)
-        n_current = len(X_combined)
-
-        # 4. 补充扰动样本（围绕精英解）
-        if n_current < n_samples:
-            n_perturb = int(min(int(n_samples) - int(n_current), int(len(pareto_X))))
-            dim = int(X_ga.shape[1])
-            noise = torch.randn(int(n_perturb), int(dim), device=device) * float(noise_scale)
-            perturbed_X = torch.clamp(pareto_X[:n_perturb] + noise, 0, 1)
-
-            # 评估扰动样本 - 确保输入在正确设备上
-            perturbed_Y = evaluator(perturbed_X.to(device))
-
-            # 统一设备处理
-            if isinstance(perturbed_Y, (np.ndarray, list)):
-                perturbed_Y = torch.tensor(perturbed_Y, device=device, dtype=torch.double)
-            elif isinstance(perturbed_Y, torch.Tensor):
-                perturbed_Y = perturbed_Y.to(device)
-            else:
-                raise TypeError("评估器返回类型不支持")
-
-            # 提取需要的3个目标（成本、赖氨酸、能量）
-            nutrient_names = evaluator.get_nutrient_names()
-            lysin_idx = 1 + nutrient_names.index('L')
-            energy_idx = 1 + nutrient_names.index('Energy')
-
-            perturbed_Y = torch.stack([
-                perturbed_Y[:, 0],  # 成本（最小化）
-                perturbed_Y[:, lysin_idx],  # 赖氨酸（最大化）
-                perturbed_Y[:, energy_idx]  # 能量（最大化）
-            ], dim=1)
-
-            # 确保合并前的张量在相同设备
-            X_combined = X_combined.to(device)
-            Y_combined = Y_combined.to(device)
-
-            # 安全合并
-            X_combined = torch.cat([X_combined, perturbed_X])
-            Y_combined = torch.cat([Y_combined, perturbed_Y])
-
-            print(f"添加{len(perturbed_X)}个扰动样本")
 
         # 去重（避免重复样本影响BO）
         X_combined, Y_combined = self.deduplicate_rows(X_combined, Y_combined, precision=8)
