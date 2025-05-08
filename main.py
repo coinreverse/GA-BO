@@ -39,6 +39,7 @@ def main():
     evaluator = FeedEvaluator(config_path="configs/feed_config.yaml",
                               device='cuda' if torch.cuda.is_available() else 'cpu', precision='float32')
     ref_point = torch.tensor(hybrid_config['ref_point'])
+    weights = torch.tensor(hybrid_config['bo_weights'])
     strategy = HybridStrategy(ref_point)
 
     # 阶段1: GA全局探索
@@ -46,7 +47,7 @@ def main():
 
     X_ga, Y_ga, ga_population, ga_metadata = run_ga(
         evaluator=evaluator,
-        config_path="configs/ga_config.yaml",
+        ref_point=ref_point
     )
 
     # 提取切换判断所需数据
@@ -93,6 +94,7 @@ def main():
         bo = BOOptimizer(
             bounds=feed_config['ingredient_bounds'],  # 直接传入边界字典
             ref_point=ref_point,
+            weights=weights
         )
         X_hybrid, Y_hybrid = bo.optimize(
             X_init=X_init,

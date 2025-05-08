@@ -42,7 +42,7 @@ class FeedEvaluator:
         assert self.costs.shape == (17,), "成本向量必须为17维"
         assert self.nutrition.shape == (17, 10), "营养矩阵必须有17种原料和10种营养素"
 
-    def __call__(self, X: torch.Tensor, tol: float = 0.01) -> torch.Tensor:
+    def __call__(self, X: torch.Tensor, tol: float = 0.05) -> torch.Tensor:
         """
         评估饲料配方 (兼容NumPy和PyTorch输入)
         修改说明：

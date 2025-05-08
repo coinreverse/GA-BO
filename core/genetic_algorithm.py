@@ -11,9 +11,7 @@ from pymoo.operators.sampling.rnd import FloatRandomSampling
 from pymoo.operators.sampling.lhs import LHS
 from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 from pymoo.indicators.hv import Hypervolume  # 用于超体积计算
-from typing import Tuple
-
-from scipy.stats import pareto
+from typing import Tuple, Optional
 
 from core.hybrid_strategy import HybridStrategy
 
@@ -74,7 +72,7 @@ class DirichletSampling(FloatRandomSampling):
 
 
 class FeedProblem(Problem):
-    def __init__(self, evaluator, n_var=17, config_path="configs/ga_config.yaml"):
+    def __init__(self, evaluator, n_var=17, ref_point: Optional[torch.Tensor] = None,):
         """
         饲料配方优化问题定义 (与FeedEvaluator完全兼容)
 
@@ -95,17 +93,12 @@ class FeedProblem(Problem):
         self.current_gen = 0
         self.nutrient_names = evaluator.get_nutrient_names()
         self.repair = NormalizationRepair(self.xu)
-        ref_point = torch.tensor([200.0, 0.0, 0.0])
+        self.ref_point = ref_point
         self.strategy = HybridStrategy(ref_point)
         self.ga_history = []
         self.best_solutions = []
         self.raw_objectives = None  # 存储原始目标值
-        with open(config_path) as f:
-            config = yaml.safe_load(f)
-        self.ref_point = torch.tensor(
-            config['ref_point'],
-            dtype=torch.float32
-        )
+
 
     def _evaluate(self, X, out, *args, **kwargs):
         # 转换为PyTorch张量
@@ -207,25 +200,26 @@ class FeedProblem(Problem):
 
 def run_ga(
         evaluator,
-        config_path: str = "configs/ga_config.yaml"
-) -> Tuple[torch.Tensor, torch.Tensor]:
+        config_path: str = "configs/ga_config.yaml",
+        ref_point=None) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     执行遗传算法优化 (兼容FeedEvaluator)
 
     Args:
+        ref_point: 参考点
+        config_path: ga算法配置路径
         evaluator: FeedEvaluator实例
-        config_path: 遗传算法配置路径
 
     Returns:
         X: 最优解集 (n_samples, 17)
         F: 目标值集 (n_samples, 3) [成本, 赖氨酸, 能量]
     """
+
     # 加载配置
     with open(config_path, encoding='utf-8') as f:
         config = yaml.safe_load(f)
-
     # 初始化问题
-    problem = FeedProblem(evaluator)
+    problem = FeedProblem(evaluator, ref_point=ref_point)
 
     # 动态加载采样器
     sampling_mapping = {

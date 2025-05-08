@@ -35,5 +35,5 @@ ingredient_bounds:
 # 其他配置
 settings:
   device: "cpu"          # 默认计算设备
-  tol: 0.01              # 配方总和容差
+  tol: 0.05              # 配方总和容差
   max_iter: 100          # 优化迭代次数

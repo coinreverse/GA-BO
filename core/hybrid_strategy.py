@@ -11,7 +11,7 @@ class HybridStrategy:
         初始化混合策略
 
         Args:
-            ref_point: 用于计算超体积的参考点 (成本, 赖氨酸, 能量)
+            ref_point: 用于计算超体积的参考点
         """
         self.ref_point = ref_point.float()
         self.hv_calculator = Hypervolume(ref_point=ref_point)
@@ -76,46 +76,46 @@ class HybridStrategy:
             diversity_weight: float = 0.3
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        改进的精英选择策略（考虑目标值和多样性）
+        动态精英选择策略（自动平衡目标值和多样性）
 
         Args:
             X: 候选解集 (n_samples, n_var)
             Y: 目标值集 (n_samples, n_obj)
             n_elites: 选择的精英数量
-            diversity_weight: 多样性权重 (0-1)
+            diversity_weight: 基础多样性权重 (0-1)
 
         Returns:
             elite_X: 精英解集
             elite_Y: 精英目标值
         """
-
-        # 确保所有张量在同一设备上
-        device = X.device  # 获取 X 的设备（GPU 或 CPU）
+        device = X.device
         Y = Y.to(device)
-        diversity_weight = torch.tensor(diversity_weight, device=device)  # 将权重转为张量并移到正确设备
 
         # 获取帕累托前沿
         pareto_mask = pareto.is_non_dominated(Y)
         pareto_X, pareto_Y = X[pareto_mask], Y[pareto_mask]
 
+        # 如果解不足直接返回
         if len(pareto_X) <= n_elites:
             return pareto_X, pareto_Y
 
-        # 计算目标空间分数 (标准化处理)
-        obj_scores = pareto_Y.clone()
-        obj_scores[:, 0] = -obj_scores[:, 0]  # 成本最小化
-        obj_scores = (obj_scores - obj_scores.min(0).values) / \
-                     (obj_scores.max(0).values - obj_scores.min(0).values + 1e-6)
-        obj_rank = obj_scores.mean(1)
+        # 计算成本排名（成本越低，rank越高）
+        cost_rank = torch.argsort(torch.argsort(pareto_Y[:, 0]))  # 双重argsort得到排名
+        cost_rank = 1.0 - (cost_rank.float() / (len(cost_rank) - 1))  # 归一化到[0,1]
 
-        # 计算多样性分数 (基于决策空间距离)
-        dist_matrix = torch.cdist(pareto_X, pareto_X, p=2)
-        diversity_score = dist_matrix.mean(1)
-        diversity_rank = diversity_score / diversity_score.max()
+        # 计算多样性（目标空间拥挤距离）
+        dist_matrix = torch.cdist(pareto_Y, pareto_Y, p=2)
+        diversity_score = dist_matrix.sort(dim=1).values[:, 1]  # 第二近邻距离
+        diversity_rank = (diversity_score - diversity_score.min()) / (
+                diversity_score.max() - diversity_score.min() + 1e-6)
 
-        # 综合排名
-        combined_rank = (1 - diversity_weight) * obj_rank + diversity_weight * diversity_rank
-        elite_indices = torch.argsort(combined_rank, descending=True)[:n_elites]
+        if diversity_weight == 0:
+            # 纯成本优化：选择成本最低的n_elites个解
+            elite_indices = torch.argsort(pareto_Y[:, 0])[:n_elites]
+        else:
+            # 综合排名：加权成本和多样性
+            combined_rank = (1 - diversity_weight) * cost_rank + diversity_weight * diversity_rank
+            elite_indices = torch.argsort(combined_rank, descending=True)[:n_elites]
 
         return pareto_X[elite_indices], pareto_Y[elite_indices]
 

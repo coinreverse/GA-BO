@@ -3,7 +3,7 @@ import gpytorch
 from botorch.models import SingleTaskGP
 from botorch.fit import fit_gpytorch_mll
 from botorch.acquisition import qLogExpectedImprovement
-from botorch.acquisition.objective import LinearMCObjective
+from botorch.acquisition.objective import GenericMCObjective
 from botorch.models.transforms import Normalize
 from botorch.optim import optimize_acqf
 from botorch.models.transforms.outcome import Standardize
@@ -17,6 +17,7 @@ class BOOptimizer:
             self,
             bounds: Dict[str, List[float]],
             ref_point: Optional[torch.Tensor] = None,
+            weights: Optional[torch.Tensor] = None,
             device: str = "cuda" if torch.cuda.is_available() else "cpu"
     ):
         """
@@ -25,7 +26,6 @@ class BOOptimizer:
         Args:
             bounds: 边界字典 {'lower': [..], 'upper': [..]}
             ref_point: 参考点张量
-            acqf_config: 采集函数配置
             device: 计算设备
         """
         self.device = torch.device(device)
@@ -37,9 +37,8 @@ class BOOptimizer:
             dtype=self.precision
         )
         self.ref_point = ref_point.to(device=self.device, dtype=torch.double)
+        self.weights = weights.to(device=self.device, dtype=torch.double)
 
-        # 默认目标权重（可根据实际情况调整）
-        self.default_weights = torch.tensor([-1.0, 1.0, 1.0], device=self.device, dtype=torch.double)
 
         # 优化状态
         self._X = None
@@ -78,8 +77,6 @@ class BOOptimizer:
         # 初始化模型
         self._update_model()
 
-        X_candidates = []
-        Y_candidates = []
 
         for _ in range(n_iter):
             # 获取下一批候选点
@@ -90,26 +87,31 @@ class BOOptimizer:
             Y_new = evaluator(candidates) if evaluator else self._Y[torch.cdist(candidates, self._X).argmin(dim=1)]
             print("=========================",Y_new)
 
-            # 过滤无效解
-            valid_mask = (Y_new[:, 0] < 1e5)  # 只保留有效解
+            print(f"Iter {_}: Candidates = {candidates}")
+            print(f"Iter {_}: Evaluated Y = {Y_new}")
+            with torch.no_grad():
+                posterior = self._model.posterior(candidates).mean
+                print(f"Iter {_}: GP Predicted Y = {posterior}")
+            valid_mask = (Y_new[:, 0] < 1e3)  # 只保留有效解
             if valid_mask.any():  # 如果有有效解才更新
                 self.update(candidates[valid_mask], Y_new[valid_mask].to(dtype=torch.double))
-                X_candidates.append(candidates[valid_mask])
-                Y_candidates.append(Y_new[valid_mask])
             else:
-                print("Warning: 本批次所有候选解均无效")
+                print(f"Iter {_}: 无有效解")
 
 
+        print("Final X----------------", self._X)
+        print("Final Y=============================", self._Y)
         return self._X, self._Y
 
 
     def _update_model(self):
         """更新高斯过程模型"""
+        outcome_transform = Standardize(m=self._Y.shape[-1])
         self._model = SingleTaskGP(
             self._X,
             self._Y,
             input_transform=Normalize(d=self._X.shape[-1]),
-            outcome_transform=Standardize(m=self._Y.shape[-1])
+            outcome_transform=outcome_transform
         )
 
         # 设置噪声约束
@@ -132,30 +134,36 @@ class BOOptimizer:
         if self._model is None:
             raise RuntimeError("Model not initialized. Call initialize() first.")
 
-        # 只使用有效解计算参考点（过滤掉惩罚值）
+            # 只使用有效解
         valid_mask = (self._Y[:, 0] < 1e5)
         if not valid_mask.any():
             # 无有效解时退回随机采样
-            return torch.rand(batch_size, self.bounds.shape[1],
-                              device=self.device, dtype=self.precision)
+            return self._random_sample(batch_size)
 
         Y_valid = self._Y[valid_mask]
-        Y_normalized = (Y_valid - Y_valid.mean(0)) / (Y_valid.std(0) + 1e-6)
 
-        # 多目标处理（使用有效解）
-        if Y_normalized.shape[1] > 1:
-            partitioning = DominatedPartitioning(
-                ref_point=self.ref_point.to(dtype=self.precision),
-                Y=Y_valid
-            )
-            best_f = partitioning.compute_hypervolume()
-            weights = torch.ones(Y_normalized.shape[1], device=self.device, dtype=self.precision)
-            objective = LinearMCObjective(weights)
+        # 多目标处理
+        if Y_valid.shape[1] > 1:
+            if self.weights is not None:
+                # 修正GenericMCObjective的使用方式
+                def objective(samples, X=None):
+                    return samples @ self.weights
+                objective = GenericMCObjective(objective)
+                best_f = (Y_valid * self.weights).sum(dim=1).max()
+            else:
+                # 使用参考点进行多目标优化
+                if self.ref_point is None:
+                    raise ValueError("For multi-objective optimization, either weights or ref_point must be provided")
+                partitioning = DominatedPartitioning(
+                    ref_point=self.ref_point,
+                    Y=Y_valid
+                )
+                best_f = partitioning.compute_hypervolume()
+                objective = None
         else:
-            best_f = Y_normalized.max()
+            best_f = Y_valid.max()
             objective = None
 
-        # 生成候选点
         acqf = qLogExpectedImprovement(
             model=self._model,
             best_f=best_f,
@@ -171,14 +179,25 @@ class BOOptimizer:
             options={"batch_limit": 5}
         )
 
-        # 强制满足约束
-        candidates = candidates.clamp(min=self.bounds[0], max=self.bounds[1])
-        candidates = candidates / candidates.sum(dim=1, keepdim=True)  # 归一化总和
-
         return candidates.detach()
+
+    def _random_sample(self, batch_size: int) -> torch.Tensor:
+        """在边界内随机采样"""
+        return torch.rand(
+            batch_size,
+            self.bounds.shape[1],
+            device=self.device,
+            dtype=self.precision
+        ) * (self.bounds[1] - self.bounds[0]) + self.bounds[0]
+
 
     def update(self, X_new: torch.Tensor, Y_new: torch.Tensor):
         """更新观测数据"""
-        self._X = torch.cat([self._X, X_new.to(device=self.device, dtype=torch.double)])
-        self._Y = torch.cat([self._Y, Y_new.to(device=self.device, dtype=torch.double)])
+        X_all = torch.cat([self._X, X_new.to(device=self.device, dtype=torch.double)])
+        Y_all = torch.cat([self._Y, Y_new.to(device=self.device, dtype=torch.double)])
+
+        # 全局过滤有效解
+        valid_mask = Y_all[:, 0] < 1e3
+        self._X = X_all[valid_mask]
+        self._Y = Y_all[valid_mask]
         self._update_model()
