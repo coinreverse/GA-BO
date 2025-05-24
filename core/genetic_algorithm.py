@@ -11,6 +11,7 @@ from pymoo.operators.sampling.rnd import FloatRandomSampling
 from pymoo.operators.sampling.lhs import LHS
 from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 from pymoo.indicators.hv import Hypervolume  # 用于超体积计算
+from pymoo.core.termination import Termination
 from typing import Tuple, Optional
 
 from core.hybrid_strategy import HybridStrategy
@@ -72,7 +73,7 @@ class DirichletSampling(FloatRandomSampling):
 
 
 class FeedProblem(Problem):
-    def __init__(self, evaluator, n_var=17, ref_point: Optional[torch.Tensor] = None,):
+    def __init__(self, evaluator, n_var=17, ref_point: Optional[torch.Tensor] = None, ):
         """
         饲料配方优化问题定义 (与FeedEvaluator完全兼容)
 
@@ -98,7 +99,6 @@ class FeedProblem(Problem):
         self.ga_history = []
         self.best_solutions = []
         self.raw_objectives = None  # 存储原始目标值
-
 
     def _evaluate(self, X, out, *args, **kwargs):
         # 转换为PyTorch张量
@@ -198,6 +198,101 @@ class FeedProblem(Problem):
             print(f"可行解比例: {feasible_count}/{len(pf_indices)} ({feasible_count / len(pf_indices):.1%})")
 
 
+def compute_hypervolume(F: torch.Tensor, ref_point: torch.Tensor, nutrient_names: list) -> float:
+    """
+    计算超体积 (Hypervolume, HV) 的独立函数
+
+    Args:
+        F: 目标值矩阵 (n_samples, n_objectives)，包含成本、赖氨酸、能量等
+        ref_point: 参考点 (torch.Tensor)，格式为 [成本, 赖氨酸, 能量]
+        nutrient_names: 营养素名称列表，用于确定赖氨酸和能量的索引
+
+    Returns:
+        hv: 超体积值 (float)
+    """
+    # 1. 转换为 numpy 数组
+    F_np = F.cpu().numpy() if isinstance(F, torch.Tensor) else F.copy()
+
+    # 2. 统一目标方向（所有目标转为最小化）
+    # 成本已经是最小化，赖氨酸和能量需要取负（因为原问题是最大化）
+    F_np[:, 1:] = -F_np[:, 1:]  # 最大化目标取负
+
+    # 3. 调整参考点（与目标方向一致）
+    hv_ref_point = np.array([
+        ref_point[0],  # 成本（最小化）
+        -ref_point[1],  # 赖氨酸（转为最小化）
+        -ref_point[2]  # 能量（转为最小化）
+    ])
+
+    # 4. 计算非支配前沿
+    nds = NonDominatedSorting()
+    front_indices = nds.do(F_np, only_non_dominated_front=True)
+
+    # 5. 计算 HV（仅使用非支配解）
+    if len(front_indices) > 0:
+        hv_calculator = Hypervolume(ref_point=hv_ref_point)
+        return hv_calculator(F_np[front_indices])
+    return 0.0
+
+
+class HVTermination(Termination):
+    def __init__(self, evaluator, ref_point, window_size=5, min_improvement=1e-4, n_gen_no_improve=5):
+        super().__init__()
+        self.evaluator = evaluator
+        self.ref_point = ref_point
+        self.window_size = window_size  # 计算改进率的窗口大小
+        self.min_improvement = min_improvement  # 最小改进阈值
+        self.n_gen_no_improve = n_gen_no_improve  # 无改进的最大代数
+        self.hv_history = []  # 存储每代的HV值
+        self.no_improve_count = 0  # 无改进的代数计数
+
+    def _update(self, algorithm):
+        # 获取当前种群
+        pop = algorithm.pop
+        X = torch.tensor(pop.get("X"), dtype=torch.float32, device=self.evaluator.device)
+
+        # 计算当前代的HV
+        objectives = self.evaluator(X)
+        nutrient_names = self.evaluator.get_nutrient_names()
+        lysine_idx = 1 + nutrient_names.index('L')
+        energy_idx = 1 + nutrient_names.index('Energy')
+
+        F = torch.stack([
+            objectives[:, 0],  # 成本
+            objectives[:, lysine_idx],  # 赖氨酸
+            objectives[:, energy_idx]  # 能量
+        ], dim=1)
+
+        hv_val = compute_hypervolume(F, self.ref_point, nutrient_names)
+        self.hv_history.append(hv_val)
+
+        # 计算改进率
+        if len(self.hv_history) > self.window_size:
+            # 计算最近window_size代的改进率（只计算最新一代与前一代的改进）
+            current_improvement = (self.hv_history[-1] - self.hv_history[-2]) / abs(self.hv_history[-2])
+            # 更新无改进计数
+            if current_improvement < self.min_improvement:
+                self.no_improve_count += 1
+            else:
+                self.no_improve_count = 0
+
+            # 调试输出
+            print(f"Generation {algorithm.n_gen}: HV={hv_val:.4f}, "
+                  f"Avg Improvement={current_improvement:.6f}, "
+                  f"No Improve Count={self.no_improve_count}")
+
+            # 检查终止条件
+            if self.no_improve_count >= self.n_gen_no_improve:
+                return True
+
+        return False
+
+
+    def get_hv_history(self):
+        """提供给外部访问 hv_history 的方法"""
+        return self.hv_history
+
+
 def run_ga(
         evaluator,
         config_path: str = "configs/ga_config.yaml",
@@ -248,11 +343,20 @@ def run_ga(
         constraints_handling="death_penalty"  # 自适应约束处理
     )
 
+    # 创建自定义终止条件
+    termination = HVTermination(
+        evaluator=evaluator,
+        ref_point=ref_point,
+        window_size=5,  # 计算5代平均改进率
+        min_improvement=1e-4,  # 最小改进阈值
+        n_gen_no_improve=5  # 连续5代无显著改进则终止
+    )
+
     # 运行优化
     res = minimize(
         problem,
         algorithm,
-        termination=('n_gen', config['n_gen']),
+        termination=termination,
         seed=config.get('seed', 1),
         verbose=True,
     )
@@ -290,75 +394,15 @@ def run_ga(
         print(f"- 赖氨酸: {F[best_idx, 1 + lysine_idx].item():.3f}%")
         print(f"- 能量: {F[best_idx, 1 + energy_idx].item():.2f} MJ/kg")
 
-    # 新增: 计算每代的超体积历史
-    hv_history = []
-    if hasattr(res, 'history'):
-        for gen_idx, record in enumerate(res.history):
-            if gen_idx % 5 == 0 and hasattr(record, 'pop'):
-                # 获取当前代的X值
-                X_gen = torch.tensor(record.pop.get("X"), dtype=torch.float32, device=evaluator.device)
-
-                # 重新计算原始目标值（确保使用正确的方向）
-                objectives = evaluator(X_gen)
-                nutrient_names = evaluator.get_nutrient_names()
-                lysin_idx = 1 + nutrient_names.index('L')
-                energy_idx = 1 + nutrient_names.index('Energy')
-
-                # 构建原始目标矩阵 [成本, 赖氨酸, 能量]
-                F_gen = torch.stack([
-                    objectives[:, 0],  # 成本（最小化）
-                    objectives[:, lysin_idx],  # 赖氨酸（最大化）
-                    objectives[:, energy_idx]  # 能量（最大化）
-                ], dim=1)
-
-                def compute_hypervolume(F, ref_point):
-                    """修正后的HV计算函数"""
-                    # 1. 转换为numpy数组
-                    F_np = F.cpu().numpy() if isinstance(F, torch.Tensor) else F.copy()
-
-                    # 2. 统一目标方向（所有目标转为最小化）
-                    # 注意：成本已经是最小化，只需转换赖氨酸和能量
-                    F_np[:, 1:] = -F_np[:, 1:]  # 最大化目标取负
-
-                    # 3. 调整参考点（与目标方向一致）
-                    hv_ref_point = np.array([
-                        ref_point[0],  # 成本（最小化）
-                        -ref_point[1],  # 赖氨酸（转为最小化）
-                        -ref_point[2]  # 能量（转为最小化）
-                    ])
-
-                    # 4. 计算非支配前沿
-                    nds = NonDominatedSorting()
-                    front_indices = nds.do(F_np, only_non_dominated_front=True)
-
-                    # 5. 计算HV（仅使用非支配解）
-                    if len(front_indices) > 0:
-                        hv_calculator = Hypervolume(ref_point=hv_ref_point)
-                        return hv_calculator(F_np[front_indices])
-                    return 0.0
-
-                # 使用配置的参考点计算HV
-                hv_val = compute_hypervolume(F_gen, problem.ref_point.cpu().numpy())
-                hv_history.append((gen_idx, hv_val))
-
-                # 调试输出
-                print(f"Generation {gen_idx}: HV = {hv_val:.4f}")
-
-    # 计算HV改进量（基于最近5代的平均值）
-    window_size = 5
-    hv_improvement = 0.0
-    if len(hv_history) >= window_size:
-        recent_hv = [hv for _, hv in hv_history[-window_size:]]
-        hv_improvement = (recent_hv[-1] - recent_hv[0]) / window_size
-
-    # 提取纯HV值列表（按代数排序）
-    sorted_hv_history = sorted(hv_history, key=lambda x: x[0])
-    hv_values = [hv for _, hv in sorted_hv_history]
+    # 提取HV历史
+    if hasattr(res, 'algorithm') and hasattr(res.algorithm, 'termination'):
+        hv_history = res.algorithm.termination.hv_history
+    else:
+        hv_history = termination.hv_history  # 回退到原始 termination 对象
 
     # 返回结果
     return X_valid, F_valid, population, {
         "best_solutions": problem.best_solutions,
-        "hv_history": hv_values,
-        "hv_improvement": max(hv_improvement, 0),  # 确保非负
+        "hv_history": hv_history,
         "population_F": torch.tensor(res.pop.get("F"), dtype=torch.float32)
     }

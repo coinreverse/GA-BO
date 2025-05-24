@@ -1,12 +1,11 @@
 import torch
+import time
 from typing import Dict, Any
 import yaml
-from core.genetic_algorithm import run_ga
+from core.genetic_algorithm1 import run_ga
 from core.bayesian_optim import BOOptimizer
 from core.evaluator import FeedEvaluator
 from core.hybrid_strategy import HybridStrategy
-from utils.visualization import plot_pareto_front
-import matplotlib.pyplot as plt
 
 
 def load_configs() -> Dict[str, Any]:
@@ -32,6 +31,9 @@ def save_results(X: torch.Tensor, Y: torch.Tensor, filename: str = "results/pare
 
 
 def main():
+    # 记录总开始时间
+    start_time = time.time()
+
     # 加载配置
     ga_config, bo_config, hybrid_config, feed_config = load_configs()
 
@@ -47,29 +49,24 @@ def main():
 
     X_ga, Y_ga, ga_population, ga_metadata = run_ga(
         evaluator=evaluator,
-        ref_point=ref_point
+        ref_point=ref_point,
     )
+
+    ga_time = time.time() - start_time  # 计算GA耗时
+    print(f"GA阶段耗时: {ga_time:.2f}秒")
 
     # 提取切换判断所需数据
     ga_population = ga_metadata["population_F"]  # 目标值矩阵
     ga_hv_history = ga_metadata["hv_history"]  # 超体积历史列表
+    print("---------------------", ga_hv_history)
 
-    # 可视化GA结果
-    # fig_ga = plot_pareto_front(
-    #     Y_ga,
-    #     title="GA Pareto Front",
-    #     ref_point=ref_point,
-    #     angle=(25, 45)
-    # )
-    # plt.savefig("results/ga_pareto.png")
-    # plt.close()
 
     # 自适应切换决策
-    if False:
-    # if strategy.should_switch_to_bo(
-    #         ga_hv_history=ga_hv_history,
-    #         ga_population=ga_population,
-    # ):
+    # if False:
+    if strategy.should_switch_to_bo(
+            ga_hv_history=ga_hv_history,
+            ga_population=ga_population,
+    ):
         # 阶段2: BO局部开发
         print("\n=== Phase 2: Bayesian Optimization Refinement ===")
 
@@ -115,16 +112,7 @@ def main():
         diversity_weight=hybrid_config['diversity_weight']
     )
 
-    # 可视化最终结果
-    # fig_final = plot_pareto_front(
-    #     elite_Y,
-    #     title="Final Pareto Front",
-    #     ref_point=ref_point,
-    #     angle=(30, 50),
-    #     figsize=(16, 12)
-    # )
-    # plt.savefig("results/final_pareto.png")
-    # plt.show()
+
 
     # 保存结果
     save_results(elite_X, elite_Y)
@@ -139,6 +127,15 @@ def main():
     print(f"- Lysine: {elite_Y[min_cost_idx, 1 + lysine_idx]:.3f}%")
     print(f"- Energy: {elite_Y[min_cost_idx, 1 + energy_idx]:.2f} MJ/kg")
     print("\nOptimization completed!")
+
+    total_time = time.time() - start_time
+    bo_time = time.time() - ga_time
+    print("\n=== 性能统计 ===")
+    print(f"总运行时间: {total_time:.2f}秒")
+    print(f"- GA阶段: {ga_time:.2f}秒 ({ga_time / total_time * 100:.1f}%)")
+    if bo_time > 0:
+        print(f"- BO阶段: {bo_time:.2f}秒 ({bo_time / total_time * 100:.1f}%)")
+
 
 
 if __name__ == "__main__":
