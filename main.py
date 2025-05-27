@@ -2,7 +2,7 @@ import torch
 import time
 from typing import Dict, Any
 import yaml
-from core.genetic_algorithm1 import run_ga
+from core.genetic_algorithm import run_ga
 from core.bayesian_optim import BOOptimizer
 from core.evaluator import FeedEvaluator
 from core.hybrid_strategy import HybridStrategy
@@ -91,7 +91,10 @@ def main():
         bo = BOOptimizer(
             bounds=feed_config['ingredient_bounds'],  # 直接传入边界字典
             ref_point=ref_point,
-            weights=weights
+            weights=weights,
+            initial_sample_size=bo_config['initial_sample_size'],
+            nutrient_bounds=feed_config['nutrient_bounds'],
+            ingredient_bounds=feed_config['ingredient_bounds'],
         )
         X_hybrid, Y_hybrid = bo.optimize(
             X_init=X_init,
@@ -129,12 +132,11 @@ def main():
     print("\nOptimization completed!")
 
     total_time = time.time() - start_time
-    bo_time = time.time() - ga_time
+    bo_time = total_time - ga_time
     print("\n=== 性能统计 ===")
     print(f"总运行时间: {total_time:.2f}秒")
     print(f"- GA阶段: {ga_time:.2f}秒 ({ga_time / total_time * 100:.1f}%)")
-    if bo_time > 0:
-        print(f"- BO阶段: {bo_time:.2f}秒 ({bo_time / total_time * 100:.1f}%)")
+    print(f"- BO阶段: {bo_time:.2f}秒 ({bo_time / total_time * 100:.1f}%)")
 
 
 

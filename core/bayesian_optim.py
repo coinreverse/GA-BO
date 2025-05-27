@@ -1,5 +1,8 @@
 import torch
 import gpytorch
+from botorch.acquisition.multi_objective import qNoisyExpectedHypervolumeImprovement, \
+    qLogNoisyExpectedHypervolumeImprovement
+from botorch.acquisition.multi_objective.objective import MCMultiOutputObjective, IdentityMCMultiOutputObjective
 from botorch.models import SingleTaskGP
 from botorch.fit import fit_gpytorch_mll
 from botorch.acquisition import qLogExpectedImprovement
@@ -18,7 +21,11 @@ class BOOptimizer:
             bounds: Dict[str, List[float]],
             ref_point: Optional[torch.Tensor] = None,
             weights: Optional[torch.Tensor] = None,
-            device: str = "cuda" if torch.cuda.is_available() else "cpu"
+            initial_sample_size: Optional[int] = None,
+            device: str = "cuda" if torch.cuda.is_available() else "cpu",
+            nutrient_bounds: Optional[Dict[str, List[float]]] = None,
+            ingredient_bounds: Optional[Dict[str, List[float]]] = None,
+            tol: float = 0.05
     ):
         """
         Bayesian Optimization 优化器
@@ -38,12 +45,73 @@ class BOOptimizer:
         )
         self.ref_point = ref_point.to(device=self.device, dtype=torch.double)
         self.weights = weights.to(device=self.device, dtype=torch.double)
+        self.initial_sample_size = initial_sample_size
 
 
         # 优化状态
         self._X = None
         self._Y = None
         self._model = None
+
+        self.tol = tol
+        if nutrient_bounds:
+            self.nutrient_lower = torch.tensor(nutrient_bounds['lower'],
+                                             device=self.device,
+                                             dtype=self.precision)
+            self.nutrient_upper = torch.tensor(nutrient_bounds['upper'],
+                                             device=self.device,
+                                             dtype=self.precision)
+        if ingredient_bounds:
+            self.ingredient_lower = torch.tensor(ingredient_bounds['lower'],
+                                               device=self.device,
+                                               dtype=self.precision)
+            self.ingredient_upper = torch.tensor(ingredient_bounds['upper'],
+                                               device=self.device,
+                                               dtype=self.precision)
+
+    def _create_objective(self):
+        """修正后的目标函数（明确处理11维输出）"""
+
+        class FeedObjective(IdentityMCMultiOutputObjective):
+            def forward(self, samples: torch.Tensor, **kwargs) -> torch.Tensor:
+                # samples形状: [..., 11]
+                Y_transformed = samples.clone()
+                Y_transformed[..., 0] = -samples[..., 0]  # 成本最小化转最大化
+                return Y_transformed
+
+        return FeedObjective()
+
+    def _create_constraints(self, model):
+        """创建针对输出维度（营养素）的约束条件"""
+        constraints = []
+
+        # 1. 营养素下限约束（如果存在）
+        if hasattr(self, 'nutrient_lower'):
+            assert len(self.nutrient_lower) == self._Y.shape[-1] - 1, \
+                f"营养素下限维度({len(self.nutrient_lower)})与输出维度({self._Y.shape[-1] - 1})不匹配"
+
+            def nutrient_lower(samples):
+                # samples形状: [..., 11] (成本 + 10种营养素)
+                nutrient_values = samples[..., 1:]  # 提取营养素部分 [..., 10]
+                lower = self.nutrient_lower.to(samples.device)
+                return (lower - nutrient_values).clamp_min(0).sum(dim=-1)  # 形状: [...]
+
+            constraints.append(nutrient_lower)
+
+        # 2. 营养素上限约束（如果存在）
+        if hasattr(self, 'nutrient_upper'):
+            assert len(self.nutrient_upper) == self._Y.shape[-1] - 1, \
+                f"营养素上限维度({len(self.nutrient_upper)})与输出维度({self._Y.shape[-1] - 1})不匹配"
+
+            def nutrient_upper(samples):
+                nutrient_values = samples[..., 1:]  # 提取营养素部分
+                upper = self.nutrient_upper.to(samples.device)
+                return (nutrient_values - upper).clamp_min(0).sum(dim=-1)
+
+            constraints.append(nutrient_upper)
+
+        return constraints
+
 
     def optimize(
             self,
@@ -66,7 +134,10 @@ class BOOptimizer:
         Returns:
             优化后的解和目标值
         """
-
+        if self.initial_sample_size is not None and self.initial_sample_size < len(X_init):
+            selected_indices = torch.randperm(len(X_init))[:self.initial_sample_size]
+            X_init = X_init[selected_indices]
+            Y_init = Y_init[selected_indices]
         # 确保数据是双精度并位于正确设备
         self._X = X_init.to(device=self.device, dtype=torch.double)
         self._Y = Y_init.to(device=self.device, dtype=torch.double)
@@ -134,40 +205,22 @@ class BOOptimizer:
         if self._model is None:
             raise RuntimeError("Model not initialized. Call initialize() first.")
 
-            # 只使用有效解
         valid_mask = (self._Y[:, 0] < 1e5)
         if not valid_mask.any():
-            # 无有效解时退回随机采样
             return self._random_sample(batch_size)
 
-        Y_valid = self._Y[valid_mask]
+        # 创建目标和约束
+        objective = self._create_objective()
+        constraints = self._create_constraints(self._model)
 
-        # 多目标处理
-        if Y_valid.shape[1] > 1:
-            if self.weights is not None:
-                # 修正GenericMCObjective的使用方式
-                def objective(samples, X=None):
-                    return samples @ self.weights
-                objective = GenericMCObjective(objective)
-                best_f = (Y_valid * self.weights).sum(dim=1).max()
-            else:
-                # 使用参考点进行多目标优化
-                if self.ref_point is None:
-                    raise ValueError("For multi-objective optimization, either weights or ref_point must be provided")
-                partitioning = DominatedPartitioning(
-                    ref_point=self.ref_point,
-                    Y=Y_valid
-                )
-                best_f = partitioning.compute_hypervolume()
-                objective = None
-        else:
-            best_f = Y_valid.max()
-            objective = None
-
-        acqf = qLogExpectedImprovement(
+        acqf = qLogNoisyExpectedHypervolumeImprovement(
             model=self._model,
-            best_f=best_f,
-            objective=objective
+            ref_point=self.ref_point,
+            X_baseline=self._X[valid_mask],
+            objective=objective,
+            constraints=constraints,
+            prune_baseline=True,
+            cache_root=True,
         )
 
         candidates, _ = optimize_acqf(
@@ -176,7 +229,9 @@ class BOOptimizer:
             q=batch_size,
             num_restarts=10,
             raw_samples=512,
-            options={"batch_limit": 5}
+            options={"batch_limit": 5},
+            sequential=True,
+            inequality_constraints=None,  # 已经在constraints中处理
         )
 
         return candidates.detach()
