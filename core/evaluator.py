@@ -14,28 +14,28 @@ class FeedEvaluator:
             device: 可选，覆盖配置文件中的设备设置
         """
         with open(config_path, encoding='utf-8') as f:
-            config = yaml.safe_load(f)
+            feed_config = yaml.safe_load(f)
 
         # 设置计算设备（优先使用传入的device参数）
         if device is not None:
             self.device = torch.device(device)
         else:
-            self.device = torch.device(config.get("settings", {}).get("device", "cpu"))
+            self.device = torch.device(feed_config.get("settings", {}).get("device", "cpu"))
 
         # 加载数据并转换为张量
         self.precision = torch.float32 if precision == 'float32' else torch.float64
-        self.costs = torch.tensor(config["costs"], device=self.device, dtype=self.precision)
-        self.nutrition = torch.tensor(config["nutrition"], device=self.device, dtype=self.precision)
-        self.lower_bounds = torch.tensor(config["nutrient_bounds"]["lower"], device=self.device, dtype=self.precision)
-        self.upper_bounds = torch.tensor(config["nutrient_bounds"]["upper"], device=self.device, dtype=self.precision)
-        self.ingredient_lower_bounds = torch.tensor(config["ingredient_bounds"]["lower"], device=self.device,
+        self.costs = torch.tensor(feed_config["costs"], device=self.device, dtype=self.precision)
+        self.nutrition = torch.tensor(feed_config["nutrition"], device=self.device, dtype=self.precision)
+        self.lower_bounds = torch.tensor(feed_config["nutrient_bounds"]["lower"], device=self.device, dtype=self.precision)
+        self.upper_bounds = torch.tensor(feed_config["nutrient_bounds"]["upper"], device=self.device, dtype=self.precision)
+        self.ingredient_lower_bounds = torch.tensor(feed_config["ingredient_bounds"]["lower"], device=self.device,
                                                     dtype=self.precision)
-        self.ingredient_upper_bounds = torch.tensor(config["ingredient_bounds"]["upper"], device=self.device,
+        self.ingredient_upper_bounds = torch.tensor(feed_config["ingredient_bounds"]["upper"], device=self.device,
                                                     dtype=self.precision)
 
         # 加载其他配置
-        self.tol = config["settings"]["tol"]
-        self.max_iter = config["settings"]["max_iter"]
+        self.tol = feed_config["settings"]["tol"]
+        self.max_iter = feed_config["settings"]["max_iter"]
         self.penalty_value = 1e6
 
         # 输入验证

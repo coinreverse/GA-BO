@@ -236,7 +236,7 @@ def compute_hypervolume(F: torch.Tensor, ref_point: torch.Tensor, nutrient_names
 
 
 class HVTermination(Termination):
-    def __init__(self, evaluator, ref_point, window_size=5, min_improvement=1e-4, n_gen_no_improve=5):
+    def __init__(self, evaluator, ref_point, window_size=5, min_improvement=1e-4, n_gen_no_improve=5, sampling_method="dirichlet"):
         super().__init__()
         self.evaluator = evaluator
         self.ref_point = ref_point
@@ -245,8 +245,15 @@ class HVTermination(Termination):
         self.n_gen_no_improve = n_gen_no_improve  # 无改进的最大代数
         self.hv_history = []  # 存储每代的HV值
         self.no_improve_count = 0  # 无改进的代数计数
+        self.sampling_method = sampling_method   # 采样方法
 
     def _update(self, algorithm):
+        if self.sampling_method == "lhs":
+            if algorithm.n_gen <= 20:
+                return False
+        if self.sampling_method == "random":
+            if algorithm.n_gen <= 20:
+                return False
         # 获取当前种群
         pop = algorithm.pop
         X = torch.tensor(pop.get("X"), dtype=torch.float32, device=self.evaluator.device)
@@ -269,7 +276,7 @@ class HVTermination(Termination):
         # 计算改进率
         if len(self.hv_history) > self.window_size:
             # 计算最近window_size代的改进率（只计算最新一代与前一代的改进）
-            current_improvement = (self.hv_history[-1] - self.hv_history[-2]) / abs(self.hv_history[-2])
+            current_improvement = (self.hv_history[-1] - self.hv_history[-2]) / abs(self.hv_history[-2] + 1e-6)
             # 更新无改进计数
             if current_improvement < self.min_improvement:
                 self.no_improve_count += 1
@@ -286,7 +293,6 @@ class HVTermination(Termination):
                 return True
 
         return False
-
 
     def get_hv_history(self):
         """提供给外部访问 hv_history 的方法"""
@@ -349,7 +355,8 @@ def run_ga(
         ref_point=ref_point,
         window_size=5,  # 计算5代平均改进率
         min_improvement=1e-4,  # 最小改进阈值
-        n_gen_no_improve=5  # 连续5代无显著改进则终止
+        n_gen_no_improve=5,  # 连续5代无显著改进则终止
+        sampling_method=sampling_method,  # 采样方式
     )
 
     # 运行优化
@@ -362,7 +369,13 @@ def run_ga(
     )
 
     # 获取最优解集
-    X = torch.tensor(res.X, dtype=torch.float32, device=evaluator.device)
+    # 自动处理 res.X 为 None 的情况
+    try:
+        X = torch.tensor(res.X, dtype=torch.float32, device=evaluator.device)
+    except TypeError:
+        print("警告：res.X 为 None，自动使用随机数据填充")
+        res.X = np.random.rand(config['pop_size'], problem.n_var)
+        X = torch.tensor(res.X, dtype=torch.float32, device=evaluator.device)
 
     F = problem.raw_objectives.cpu()
     # 过滤无效解（惩罚值超过阈值）

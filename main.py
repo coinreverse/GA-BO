@@ -6,6 +6,7 @@ from core.genetic_algorithm import run_ga
 from core.bayesian_optim import BOOptimizer
 from core.evaluator import FeedEvaluator
 from core.hybrid_strategy import HybridStrategy
+from utils.plot_ga_convergence import plot_convergence
 
 
 def load_configs() -> Dict[str, Any]:
@@ -59,6 +60,12 @@ def main():
     ga_population = ga_metadata["population_F"]  # 目标值矩阵
     ga_hv_history = ga_metadata["hv_history"]  # 超体积历史列表
     print("---------------------", ga_hv_history)
+    # 4. 绘制收敛曲线
+    plot_convergence(
+        hv_history=ga_metadata["hv_history"],
+        best_solutions=ga_metadata["best_solutions"],
+        save_path="results/ga_random_convergence.png"  # 可选保存路径
+    )
 
 
     # 自适应切换决策

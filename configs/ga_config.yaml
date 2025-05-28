@@ -14,4 +14,6 @@ mutation:
   eta: 20      # 分布指数
 
 # 其他参数
-sampling: Dirichlet
+#sampling: dirichlet
+#sampling: lhs
+sampling: random
