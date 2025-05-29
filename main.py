@@ -64,7 +64,7 @@ def main():
     plot_convergence(
         hv_history=ga_metadata["hv_history"],
         best_solutions=ga_metadata["best_solutions"],
-        save_path="results/ga_random_convergence.png"  # 可选保存路径
+        save_path="results/ga_convergence.png"  # 可选保存路径
     )
 
 

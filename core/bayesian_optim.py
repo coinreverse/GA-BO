@@ -11,6 +11,9 @@ from botorch.models.transforms import Normalize
 from botorch.optim import optimize_acqf
 from botorch.models.transforms.outcome import Standardize
 from botorch.utils.multi_objective.box_decompositions.dominated import DominatedPartitioning
+from botorch.utils.multi_objective.box_decompositions.non_dominated import FastNondominatedPartitioning
+from botorch.sampling import SobolQMCNormalSampler
+from botorch.acquisition.multi_objective import qExpectedHypervolumeImprovement
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from typing import Tuple, Optional, Dict, List
 
@@ -25,7 +28,8 @@ class BOOptimizer:
             device: str = "cuda" if torch.cuda.is_available() else "cpu",
             nutrient_bounds: Optional[Dict[str, List[float]]] = None,
             ingredient_bounds: Optional[Dict[str, List[float]]] = None,
-            tol: float = 0.05
+            tol: float = 0.05,
+            mc_samples: int = 64
     ):
         """
         Bayesian Optimization 优化器
@@ -52,6 +56,8 @@ class BOOptimizer:
         self._X = None
         self._Y = None
         self._model = None
+        self.mc_samples = mc_samples
+        self.sampler = SobolQMCNormalSampler(sample_shape=torch.Size([self.mc_samples]))
 
         self.tol = tol
         if nutrient_bounds:
@@ -80,37 +86,6 @@ class BOOptimizer:
                 return Y_transformed
 
         return FeedObjective()
-
-    def _create_constraints(self, model):
-        """创建针对输出维度（营养素）的约束条件"""
-        constraints = []
-
-        # 1. 营养素下限约束（如果存在）
-        if hasattr(self, 'nutrient_lower'):
-            assert len(self.nutrient_lower) == self._Y.shape[-1] - 1, \
-                f"营养素下限维度({len(self.nutrient_lower)})与输出维度({self._Y.shape[-1] - 1})不匹配"
-
-            def nutrient_lower(samples):
-                # samples形状: [..., 11] (成本 + 10种营养素)
-                nutrient_values = samples[..., 1:]  # 提取营养素部分 [..., 10]
-                lower = self.nutrient_lower.to(samples.device)
-                return (lower - nutrient_values).clamp_min(0).sum(dim=-1)  # 形状: [...]
-
-            constraints.append(nutrient_lower)
-
-        # 2. 营养素上限约束（如果存在）
-        if hasattr(self, 'nutrient_upper'):
-            assert len(self.nutrient_upper) == self._Y.shape[-1] - 1, \
-                f"营养素上限维度({len(self.nutrient_upper)})与输出维度({self._Y.shape[-1] - 1})不匹配"
-
-            def nutrient_upper(samples):
-                nutrient_values = samples[..., 1:]  # 提取营养素部分
-                upper = self.nutrient_upper.to(samples.device)
-                return (nutrient_values - upper).clamp_min(0).sum(dim=-1)
-
-            constraints.append(nutrient_upper)
-
-        return constraints
 
 
     def optimize(
@@ -150,28 +125,43 @@ class BOOptimizer:
 
 
         for _ in range(n_iter):
-            # 获取下一批候选点
-            candidates = self.get_next_candidate(batch_size=batch_size)
-            print("-----------------------",candidates)
+            acq_func = qExpectedHypervolumeImprovement(
+                model=self._model,
+                ref_point=self.ref_point,
+                partitioning=FastNondominatedPartitioning(
+                    ref_point=self.ref_point,
+                    Y=self._Y
+                ),
+                sampler=self.sampler,
+                objective=self._create_objective()
+            )
+            # 优化采集函数获取新点
+            candidates, _ = optimize_acqf(
+                acq_function=acq_func,
+                bounds=self.bounds,
+                q=batch_size,
+                num_restarts=10,
+                raw_samples=512,
+                options={"batch_limit": 5}
+            )
+            # 评估新点
+            new_Y = evaluator(candidates)
 
-            # 评估候选点
-            Y_new = evaluator(candidates) if evaluator else self._Y[torch.cdist(candidates, self._X).argmin(dim=1)]
-            print("=========================",Y_new)
+            # 更新数据
+            self._X = torch.cat([self._X, candidates])
+            self._Y = torch.cat([self._Y, new_Y])
 
-            print(f"Iter {_}: Candidates = {candidates}")
-            print(f"Iter {_}: Evaluated Y = {Y_new}")
-            with torch.no_grad():
-                posterior = self._model.posterior(candidates).mean
-                print(f"Iter {_}: GP Predicted Y = {posterior}")
-            valid_mask = (Y_new[:, 0] < 1e3)  # 只保留有效解
-            if valid_mask.any():  # 如果有有效解才更新
-                self.update(candidates[valid_mask], Y_new[valid_mask].to(dtype=torch.double))
-            else:
-                print(f"Iter {_}: 无有效解")
+            # 更新模型
+            self._update_model()
 
+            # 计算当前超体积
+            bd = FastNondominatedPartitioning(
+                ref_point=self.ref_point,
+                Y=self._Y
+            )
+            current_hv = bd.compute_hypervolume().item()
+            print(f"Iteration {_ + 1}/{n_iter} - Hypervolume: {current_hv:.3f}")
 
-        print("Final X----------------", self._X)
-        print("Final Y=============================", self._Y)
         return self._X, self._Y
 
 
@@ -200,51 +190,6 @@ class BOOptimizer:
             max_retries=3,  # 失败时重试
             max_iter=100,  # 增加迭代次数
         )
-
-    def get_next_candidate(self, batch_size: int = 1) -> torch.Tensor:
-        if self._model is None:
-            raise RuntimeError("Model not initialized. Call initialize() first.")
-
-        valid_mask = (self._Y[:, 0] < 1e5)
-        if not valid_mask.any():
-            return self._random_sample(batch_size)
-
-        # 创建目标和约束
-        objective = self._create_objective()
-        constraints = self._create_constraints(self._model)
-
-        acqf = qLogNoisyExpectedHypervolumeImprovement(
-            model=self._model,
-            ref_point=self.ref_point,
-            X_baseline=self._X[valid_mask],
-            objective=objective,
-            constraints=constraints,
-            prune_baseline=True,
-            cache_root=True,
-        )
-
-        candidates, _ = optimize_acqf(
-            acq_function=acqf,
-            bounds=self.bounds,
-            q=batch_size,
-            num_restarts=10,
-            raw_samples=512,
-            options={"batch_limit": 5},
-            sequential=True,
-            inequality_constraints=None,  # 已经在constraints中处理
-        )
-
-        return candidates.detach()
-
-    def _random_sample(self, batch_size: int) -> torch.Tensor:
-        """在边界内随机采样"""
-        return torch.rand(
-            batch_size,
-            self.bounds.shape[1],
-            device=self.device,
-            dtype=self.precision
-        ) * (self.bounds[1] - self.bounds[0]) + self.bounds[0]
-
 
     def update(self, X_new: torch.Tensor, Y_new: torch.Tensor):
         """更新观测数据"""
