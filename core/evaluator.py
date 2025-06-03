@@ -116,6 +116,20 @@ class FeedEvaluator:
         # 检查营养界
         nutrient_lower_check = torch.all(nutrients >= self.lower_bounds, dim=1)
         nutrient_upper_check = torch.all(nutrients <= self.upper_bounds, dim=1)
+        print(f"Sum check passed: {sum_check.float().mean().item():.1%}")  # 打印通过率
+
+        # 改为逐约束检查并记录
+        checks = {
+            'sum': sum_check,
+            'ing_lower': torch.all(X >= self.ingredient_lower_bounds, dim=1),
+            'ing_upper': torch.all(X <= self.ingredient_upper_bounds, dim=1),
+            'nut_lower': torch.all(nutrients >= self.lower_bounds, dim=1),
+            'nut_upper': torch.all(nutrients <= self.upper_bounds, dim=1)
+        }
+
+        # 打印各约束通过率
+        for name, check in checks.items():
+            print(f"{name} check passed: {check.float().mean().item():.1%}")
 
         # 必须满足所有约束
         return sum_check & ingredient_lower_check & ingredient_upper_check & nutrient_lower_check & nutrient_upper_check
@@ -124,3 +138,65 @@ class FeedEvaluator:
     def get_nutrient_names() -> list:
         """获取营养素名称"""
         return ['CF', 'Ca', 'AP', 'DM', 'CP', 'MC', 'T', 'Tp', 'Energy', 'L']
+
+    def get_acquisition_constraints(self, dtype=None):
+        """获取用于采集函数的约束条件（不等式和等式约束）
+
+        返回:
+            tuple: (ineq_constraints, eq_constraints) 包含不等式和等式约束的元组
+        """
+        # 转换所有预存张量的类型
+        nutrition = self.nutrition.to(dtype=dtype)
+        costs = self.costs.to(dtype=dtype)
+        ingredient_lower_bounds = self.ingredient_lower_bounds.to(dtype=dtype)
+        ingredient_upper_bounds = self.ingredient_upper_bounds.to(dtype=dtype)
+        lower_bounds = self.lower_bounds.to(dtype=dtype)
+        upper_bounds = self.upper_bounds.to(dtype=dtype)
+
+        # 创建全1向量用于等式约束
+        ones = torch.ones(17, dtype=dtype, device=self.device)
+
+        # 不等式约束列表
+        ineq_constraints = []
+
+        # 1. 用料比例下限约束
+        for i in range(17):
+            indices = torch.tensor([i], device=self.device)
+            coefficients = torch.tensor([1.0], device=self.device, dtype=dtype)
+            rhs = float(ingredient_lower_bounds[i].item())
+            ineq_constraints.append((indices, coefficients, rhs))
+
+        # 2. 用料比例上限约束
+        for i in range(17):
+            indices = torch.tensor([i], device=self.device)
+            coefficients = torch.tensor([-1.0], device=self.device, dtype=dtype)
+            rhs = -float(ingredient_upper_bounds[i].item())
+            ineq_constraints.append((indices, coefficients, rhs))
+
+        # 3. 营养下限约束
+        for j in range(10):
+            indices = torch.arange(17, device=self.device)
+            coefficients = nutrition[:, j].clone()  # 确保是独立张量
+            rhs = float(lower_bounds[j].item())
+            ineq_constraints.append((indices, coefficients, rhs))
+
+        # 4. 营养上限约束
+        for j in range(10):
+            indices = torch.arange(17, device=self.device)
+            coefficients = -nutrition[:, j].clone()
+            rhs = -float(upper_bounds[j].item())
+            ineq_constraints.append((indices, coefficients, rhs))
+
+        # 5. 成本上限约束
+        indices = torch.arange(17, device=self.device)
+        coefficients = costs.clone()
+        rhs = 143.0
+        ineq_constraints.append((indices, coefficients, rhs))
+
+        # 等式约束
+        eq_constraints = [
+            (torch.arange(17, device=self.device), ones, 1.0)
+        ]
+
+        return ineq_constraints, eq_constraints
+

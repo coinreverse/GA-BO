@@ -107,7 +107,6 @@ def main():
             X_init=X_init,
             Y_init=Y_init,
             n_iter=bo_config['n_iter'],
-            batch_size=bo_config['batch_size'],
             evaluator=evaluator
         )
 
