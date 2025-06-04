@@ -1,20 +1,17 @@
+import time
+
 import torch
 import gpytorch
 from botorch.acquisition.multi_objective import qNoisyExpectedHypervolumeImprovement, \
-    qLogNoisyExpectedHypervolumeImprovement
-from botorch.acquisition.multi_objective.objective import MCMultiOutputObjective, IdentityMCMultiOutputObjective
+    qLogNoisyExpectedHypervolumeImprovement, qExpectedHypervolumeImprovement
 from botorch.models import SingleTaskGP
 from botorch.fit import fit_gpytorch_mll
-from botorch.acquisition import qLogExpectedImprovement
-from botorch.acquisition.objective import GenericMCObjective
 from botorch.models.transforms import Normalize
 from botorch.optim import optimize_acqf
 from botorch.models.transforms.outcome import Standardize
-from botorch.utils.multi_objective.box_decompositions.dominated import DominatedPartitioning
 from botorch.utils.multi_objective.box_decompositions.non_dominated import FastNondominatedPartitioning
 from botorch.utils.transforms import normalize
 from botorch.sampling import SobolQMCNormalSampler
-from botorch.acquisition.multi_objective import qExpectedHypervolumeImprovement
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from typing import Tuple, Optional, Dict, List
 
@@ -30,7 +27,7 @@ class BOOptimizer:
             nutrient_bounds: Optional[Dict[str, List[float]]] = None,
             ingredient_bounds: Optional[Dict[str, List[float]]] = None,
             tol: float = 0.05,
-            mc_samples: int = 64
+            mc_samples: int = 32
     ):
         """
         Bayesian Optimization 优化器
@@ -64,7 +61,7 @@ class BOOptimizer:
             'valid_ratio': []
         }
         self.mc_samples = mc_samples
-        self.sampler = SobolQMCNormalSampler(sample_shape=torch.Size([self.mc_samples]))
+        self.sampler = SobolQMCNormalSampler(sample_shape=torch.Size([self.mc_samples])).to(device=self.device)
 
         self.tol = tol
         if nutrient_bounds:
@@ -137,14 +134,15 @@ class BOOptimizer:
         candidates, _ = optimize_acqf(
             acq_function=acq_func,
             bounds=self.bounds,
-            q=1,  # 串行优化
+            q=16,  # 串行优化
             num_restarts=10,
             raw_samples=256,
             inequality_constraints=inequality_constraints,
             equality_constraints=equality_constraints,
-            options={"batch_limit": 5, "maxiter": 200},
+            options={"batch_limit": 5, "maxiter": 200, "device": self.device},
             sequential=True,
         )
+        print("candidates device:", candidates.device)  # 应为 cuda:0
 
         # 评估新点
         new_Y = evaluator(candidates)
@@ -155,32 +153,43 @@ class BOOptimizer:
         return self._X, self._Y
 
     def optimize_step_qnehvi(self, evaluator) -> Tuple[torch.Tensor, torch.Tensor]:
+        t0 = time.time()
         with torch.no_grad():
             pred = self._model.posterior(normalize(self._X, self.bounds)).mean
+        print(f"1. Posterior 耗时: {time.time() - t0:.2f}s")
+        t1 = time.time()
         inequality_constraints, equality_constraints = evaluator.get_acquisition_constraints(dtype=self.precision)
+        print(f"2. 约束生成耗时: {time.time() - t1:.2f}s")
 
-        # acq_func = qNoisyExpectedHypervolumeImprovement(
-        acq_func = qLogNoisyExpectedHypervolumeImprovement(
+        t2 = time.time()
+        acq_func = qNoisyExpectedHypervolumeImprovement(
+        # acq_func = qLogNoisyExpectedHypervolumeImprovement(
             model=self._model,
-            ref_point=self.ref_point.to(self.device),
+            ref_point=self.ref_point,
             X_baseline=normalize(self._X, bounds=self.bounds),
             sampler=self.sampler,
         )
+        print(f"3. qNEHVI 初始化耗时: {time.time() - t2:.2f}s")
+        t3 = time.time()
         candidates, _ = optimize_acqf(
             acq_function=acq_func,
             bounds=self.bounds,
             q=1,
-            num_restarts=10,
+            num_restarts=5,
             raw_samples=256,
             inequality_constraints=inequality_constraints,
             equality_constraints=equality_constraints,
-            options={"batch_limit": 5, "maxiter": 200},
+            options={"batch_limit": 5, "maxiter": 200, "device": self.device},
             sequential=True,
         )
+        print(f"4. optimize_acqf 耗时: {time.time() - t3:.2f}s")
+        print("candidates device:", candidates.device)  # 应为 cuda:0
         new_Y = evaluator(candidates)
         self._X = torch.cat([self._X, candidates])
         self._Y = torch.cat([self._Y, new_Y])
         self._update_model()
+
+        return self._X, self._Y
 
 
     def optimize(
@@ -204,10 +213,10 @@ class BOOptimizer:
             优化后的解和目标值
         """
         if self.initial_sample_size is not None and self.initial_sample_size < len(X_init):
-            selected_indices = torch.randperm(len(X_init))[:self.initial_sample_size]
-            X_init = X_init[selected_indices]
-            Y_init = Y_init[selected_indices]
-        # 确保数据精度一致并位于正确设备
+            selected_indices_X_init = torch.randperm(len(X_init), device=X_init.device)[:self.initial_sample_size]
+            selected_indices_Y_init = torch.randperm(len(Y_init), device=Y_init.device)[:self.initial_sample_size]
+            X_init = X_init[selected_indices_X_init]
+            Y_init = Y_init[selected_indices_Y_init]
         self._X = X_init.to(device=self.device, dtype=self.precision)
         self._Y = Y_init.to(device=self.device, dtype=self.precision)
         self.bounds = self.bounds.to(dtype=self.precision)

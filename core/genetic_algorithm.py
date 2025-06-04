@@ -211,7 +211,13 @@ def compute_hypervolume(F: torch.Tensor, ref_point: torch.Tensor, nutrient_names
         hv: 超体积值 (float)
     """
     # 1. 转换为 numpy 数组
-    F_np = F.cpu().numpy() if isinstance(F, torch.Tensor) else F.copy()
+    if isinstance(F, torch.Tensor):
+        F_np = F.cpu().numpy()
+    else:
+        F_np = F.copy()
+
+    if isinstance(ref_point, torch.Tensor):
+        ref_point = ref_point.cpu().numpy()
 
     # 2. 统一目标方向（所有目标转为最小化）
     # 成本已经是最小化，赖氨酸和能量需要取负（因为原问题是最大化）

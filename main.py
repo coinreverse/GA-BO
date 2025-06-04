@@ -8,6 +8,7 @@ from core.evaluator import FeedEvaluator
 from core.hybrid_strategy import HybridStrategy
 from utils.plot_ga_convergence import plot_convergence
 
+torch.set_default_tensor_type(torch.cuda.DoubleTensor)  # 全局默认 CUDA
 
 def load_configs() -> Dict[str, Any]:
     """加载所有配置文件"""
