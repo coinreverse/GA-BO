@@ -1,6 +1,7 @@
 import torch
 
 # 加载 .pt 文件
+# data = torch.load('results/ga_pareto_front.pt', map_location='cpu')  # 确保路径正确
 data = torch.load('results/pareto_front.pt', map_location='cpu')  # 确保路径正确
 
 # 打印文件内容的基本信息
@@ -17,12 +18,6 @@ elif isinstance(data, torch.Tensor):
 else:
     print("内容:", data)
 
-# 可选：保存为文本文件便于查看（如果是张量）
-# if isinstance(data, torch.Tensor):
-#     with open('output.txt', 'w') as f:
-#         f.write(f"Shape: {data.shape}\n")
-#         f.write(f"Data:\n{data}")
-#     print("\n张量已保存到 output.txt")
 import torch
 
 data = torch.load('results/pareto_front.pt', map_location='cpu')

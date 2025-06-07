@@ -73,7 +73,7 @@ class HybridStrategy:
             X: torch.Tensor,
             Y: torch.Tensor,
             n_elites: int = 10,
-            diversity_weight: float = 0.3
+            diversity_weight: float = 0
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         动态精英选择策略（自动平衡目标值和多样性）

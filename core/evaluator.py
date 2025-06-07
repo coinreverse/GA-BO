@@ -117,18 +117,6 @@ class FeedEvaluator:
         nutrient_lower_check = torch.all(nutrients >= self.lower_bounds, dim=1)
         nutrient_upper_check = torch.all(nutrients <= self.upper_bounds, dim=1)
 
-        # 改为逐约束检查并记录
-        checks = {
-            'sum': sum_check,
-            'ing_lower': torch.all(X >= self.ingredient_lower_bounds, dim=1),
-            'ing_upper': torch.all(X <= self.ingredient_upper_bounds, dim=1),
-            'nut_lower': torch.all(nutrients >= self.lower_bounds, dim=1),
-            'nut_upper': torch.all(nutrients <= self.upper_bounds, dim=1)
-        }
-
-        # 打印各约束通过率
-        for name, check in checks.items():
-            print(f"{name} check passed: {check.float().mean().item():.1%}")
 
         # 必须满足所有约束
         return sum_check & ingredient_lower_check & ingredient_upper_check & nutrient_lower_check & nutrient_upper_check

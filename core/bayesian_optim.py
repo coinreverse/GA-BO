@@ -3,7 +3,7 @@ import time
 import torch
 import gpytorch
 from botorch.acquisition.multi_objective import qNoisyExpectedHypervolumeImprovement, \
-    qLogNoisyExpectedHypervolumeImprovement, qExpectedHypervolumeImprovement
+    qLogNoisyExpectedHypervolumeImprovement, qExpectedHypervolumeImprovement, qLogExpectedHypervolumeImprovement
 from botorch.models import SingleTaskGP
 from botorch.fit import fit_gpytorch_mll
 from botorch.models.transforms import Normalize
@@ -12,6 +12,7 @@ from botorch.models.transforms.outcome import Standardize
 from botorch.utils.multi_objective.box_decompositions.non_dominated import FastNondominatedPartitioning
 from botorch.utils.transforms import normalize
 from botorch.sampling import SobolQMCNormalSampler
+from gpytorch.kernels import MaternKernel, ScaleKernel, RBFKernel
 from gpytorch.mlls import ExactMarginalLogLikelihood
 from typing import Tuple, Optional, Dict, List
 
@@ -27,7 +28,7 @@ class BOOptimizer:
             nutrient_bounds: Optional[Dict[str, List[float]]] = None,
             ingredient_bounds: Optional[Dict[str, List[float]]] = None,
             tol: float = 0.05,
-            mc_samples: int = 32
+            mc_samples: int = 64
     ):
         """
         Bayesian Optimization 优化器
@@ -61,7 +62,7 @@ class BOOptimizer:
             'valid_ratio': []
         }
         self.mc_samples = mc_samples
-        self.sampler = SobolQMCNormalSampler(sample_shape=torch.Size([self.mc_samples])).to(device=self.device)
+        self.sampler = SobolQMCNormalSampler(sample_shape=torch.Size([self.mc_samples]))
 
         self.tol = tol
         if nutrient_bounds:
@@ -90,9 +91,13 @@ class BOOptimizer:
 
         # 使用有效数据继续建模
         outcome_transform = Standardize(m=Y_valid.shape[-1])
+        # 核函数
+        covar_module = ScaleKernel(MaternKernel(nu=2.5))
+        # covar_module = ScaleKernel(RBFKernel())
         self._model = SingleTaskGP(
             X_valid,
             Y_valid,
+            covar_module=covar_module,
             input_transform=Normalize(d=X_valid.shape[-1]),
             outcome_transform=outcome_transform
         )
@@ -123,6 +128,7 @@ class BOOptimizer:
         inequality_constraints, equality_constraints = evaluator.get_acquisition_constraints(dtype=self.precision)
         # 定义采集函数
         acq_func = qExpectedHypervolumeImprovement(
+        # acq_func = qLogExpectedHypervolumeImprovement(
             model=self._model,
             ref_point=self.ref_point.to(self.device),
             partitioning=partitioning,
@@ -134,15 +140,14 @@ class BOOptimizer:
         candidates, _ = optimize_acqf(
             acq_function=acq_func,
             bounds=self.bounds,
-            q=16,  # 串行优化
+            q=1,  # 串行优化
             num_restarts=10,
             raw_samples=256,
             inequality_constraints=inequality_constraints,
             equality_constraints=equality_constraints,
-            options={"batch_limit": 5, "maxiter": 200, "device": self.device},
+            options={"batch_limit": 5, "maxiter": 200},
             sequential=True,
         )
-        print("candidates device:", candidates.device)  # 应为 cuda:0
 
         # 评估新点
         new_Y = evaluator(candidates)
@@ -175,11 +180,11 @@ class BOOptimizer:
             acq_function=acq_func,
             bounds=self.bounds,
             q=1,
-            num_restarts=5,
+            num_restarts=10,
             raw_samples=256,
             inequality_constraints=inequality_constraints,
             equality_constraints=equality_constraints,
-            options={"batch_limit": 5, "maxiter": 200, "device": self.device},
+            options={"batch_limit": 5, "maxiter": 200},
             sequential=True,
         )
         print(f"4. optimize_acqf 耗时: {time.time() - t3:.2f}s")
@@ -229,8 +234,8 @@ class BOOptimizer:
             print(f"\n=== Iteration {self.current_iter} ===")
 
             # 执行BO单步优化
-            # self._X, self._Y = self.optimize_step_qehvi(evaluator=evaluator)
-            self._X, self._Y = self.optimize_step_qnehvi(evaluator=evaluator)
+            self._X, self._Y = self.optimize_step_qehvi(evaluator=evaluator)
+            # self._X, self._Y = self.optimize_step_qnehvi(evaluator=evaluator)
 
             # 记录并打印进展
             self._update_history()
@@ -249,10 +254,16 @@ class BOOptimizer:
         if valid_ratio > 0:
             # 仅计算有效解的超体积
             valid_Y = self._Y[valid_mask]
-            bd = FastNondominatedPartitioning(
-                ref_point=self.ref_point,
-                Y=valid_Y
-            )
-            self.history['hv'].append(bd.compute_hypervolume().item())
+            bd = FastNondominatedPartitioning(ref_point=self.ref_point, Y=valid_Y)
+            current_hv = bd.compute_hypervolume().item()
+            self.history['hv'].append(current_hv)
         else:
+            current_hv = 0.0
             self.history['hv'].append(0.0)
+
+        print(
+            f"Iter {self.current_iter:3d} | "
+            f"Valid: {valid_ratio * 100:5.1f}% | "
+            f"HV: {current_hv:.4f} | "
+            f"Total points: {len(self._X)}"
+        )

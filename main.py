@@ -67,6 +67,15 @@ def main():
         best_solutions=ga_metadata["best_solutions"],
         save_path="results/ga_convergence.png"  # 可选保存路径
     )
+    # 最终结果处理
+    elite_ga_X, elite_ga_Y = strategy.elite_selection(
+        X_ga, Y_ga,
+        n_elites=hybrid_config['n_elites'],
+        diversity_weight=hybrid_config['diversity_weight']
+    )
+
+    # 保存结果
+    save_results(elite_ga_X, elite_ga_Y, filename="results/ga_pareto_front.pt")
 
 
     # 自适应切换决策
@@ -122,10 +131,8 @@ def main():
         diversity_weight=hybrid_config['diversity_weight']
     )
 
-
-
     # 保存结果
-    save_results(elite_X, elite_Y)
+    save_results(elite_X, elite_Y, filename="results/pareto_front.pt")
 
     # 输出最佳解
     nutrient_names = evaluator.get_nutrient_names()
