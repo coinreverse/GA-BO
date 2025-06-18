@@ -143,8 +143,6 @@ class FeedProblem(Problem):
         self.raw_objectives = objectives
         self._update_best_solutions(out)
 
-        if self.current_gen % 5 == 0:
-            self._debug_output(out)
 
         self.current_gen += 1
 
@@ -171,31 +169,6 @@ class FeedProblem(Problem):
             best_solution = self.raw_objectives[best_idx]
 
         self.best_solutions.append(best_solution.cpu().numpy())
-
-    def _debug_output(self, out):
-        F_np = out["F"] if isinstance(out["F"], np.ndarray) else out["F"].cpu().numpy()
-
-        fronts = NonDominatedSorting().do(F_np)
-        if len(fronts[0]) > 0:
-            pf_indices = fronts[0]
-            pf_objectives = self.raw_objectives[pf_indices].cpu().numpy()
-
-            # 获取营养素名称和对应索引
-            nutrient_names = self.evaluator.get_nutrient_names()
-            energy_idx = nutrient_names.index('Energy')
-            lysine_idx = nutrient_names.index('L')
-
-            print("\n当前帕累托前沿:")
-            print(f"- 成本范围: {pf_objectives[:, 0].min():.2f} ~ {pf_objectives[:, 0].max():.2f} €/MT")
-            print(
-                f"- 赖氨酸范围: {pf_objectives[:, lysine_idx + 1].min():.3f} ~ {pf_objectives[:, lysine_idx + 1].max():.3f}%")
-            print(
-                f"- 能量范围: {pf_objectives[:, energy_idx + 1].min():.2f} ~ {pf_objectives[:, energy_idx + 1].max():.2f} MJ/kg")
-
-            # 检查约束满足情况
-            max_violation = out["G"][pf_indices].max(axis=1)
-            feasible_count = (max_violation <= 1e-6).sum()
-            print(f"可行解比例: {feasible_count}/{len(pf_indices)} ({feasible_count / len(pf_indices):.1%})")
 
 
 def compute_hypervolume(F: torch.Tensor, ref_point: torch.Tensor, nutrient_names: list) -> float:

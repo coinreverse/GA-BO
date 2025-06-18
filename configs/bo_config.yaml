@@ -1,5 +1,5 @@
-n_iter: 15                    # 优化迭代次数
-raw_samples: 512              # 初始采样数
-initial_sample_size: 10       # 初始化数据点个数
+n_iter: 10                    # 优化迭代次数
+raw_samples: 1024              # 初始采样数
+initial_sample_size: 30      # 初始化数据点个数
 
 

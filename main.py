@@ -1,3 +1,6 @@
+import random
+
+import numpy as np
 import torch
 import time
 from typing import Dict, Any
@@ -33,6 +36,12 @@ def save_results(X: torch.Tensor, Y: torch.Tensor, filename: str = "results/pare
 
 
 def main():
+    # 设置随机种子
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+    np.random.seed(42)
+    random.seed(42)
     # 记录总开始时间
     start_time = time.time()
 
@@ -60,7 +69,7 @@ def main():
     # 提取切换判断所需数据
     ga_population = ga_metadata["population_F"]  # 目标值矩阵
     ga_hv_history = ga_metadata["hv_history"]  # 超体积历史列表
-    print("---------------------", ga_hv_history)
+
     # 4. 绘制收敛曲线
     plot_convergence(
         hv_history=ga_metadata["hv_history"],
@@ -112,13 +121,36 @@ def main():
             initial_sample_size=bo_config['initial_sample_size'],
             nutrient_bounds=feed_config['nutrient_bounds'],
             ingredient_bounds=feed_config['ingredient_bounds'],
+            monitor_config={  # 可选：监控配置
+                "obj": None,  # 可替换为自定义目标转换函数
+                "constraints": None  # 可添加约束函数列表
+            },
+            seed=42
         )
+        # 在BO初始化后添加调试输出
+        print("权重验证 - 成本权重:", weights[0], "赖氨酸权重:", weights[-2], "能量权重:", weights[-1])
+        print("目标方向验证 - 成本样本值:", Y_init[:, 0].min(), Y_init[:, 0].max())
+
+        # 运行BO前重置参考点
+        ref_point = ref_point.to(device=Y_init.device) * weights.to(device=Y_init.device)
+
+        print("\n=== BO 配置检查 ===")
+        print("参考点:", ref_point)
+        print("权重:", weights)
+        print("初始样本目标值范围:", Y_init.min(dim=0).values, Y_init.max(dim=0).values)
+        print("参考点是否支配初始样本:", (Y_init < ref_point).all(dim=1).any())
         X_hybrid, Y_hybrid = bo.optimize(
             X_init=X_init,
             Y_init=Y_init,
             n_iter=bo_config['n_iter'],
-            evaluator=evaluator
+            evaluator=evaluator,
         )
+        monitor_results = bo.get_monitor_outputs()
+        if monitor_results:
+            print("\n=== Optimization Monitoring ===")
+            print(f"Final Hypervolume: {monitor_results['hv_history'][-1]:.4f}")
+            print(f"Best Solution Found X: {monitor_results['pareto_X'][-1][0]}")
+            print(f"Best Solution Found Y: {monitor_results['pareto_Y'][-1][0]}")
 
     else:
         print("GA optimization sufficient, skipping BO phase")
@@ -132,7 +164,7 @@ def main():
     )
 
     # 保存结果
-    save_results(elite_X, elite_Y, filename="results/pareto_front.pt")
+    save_results(elite_X, elite_Y, filename="results/hybrid_pareto_front.pt")
 
     # 输出最佳解
     nutrient_names = evaluator.get_nutrient_names()

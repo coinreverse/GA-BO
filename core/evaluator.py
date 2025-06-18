@@ -26,8 +26,10 @@ class FeedEvaluator:
         self.precision = torch.float32 if precision == 'float32' else torch.float64
         self.costs = torch.tensor(feed_config["costs"], device=self.device, dtype=self.precision)
         self.nutrition = torch.tensor(feed_config["nutrition"], device=self.device, dtype=self.precision)
-        self.lower_bounds = torch.tensor(feed_config["nutrient_bounds"]["lower"], device=self.device, dtype=self.precision)
-        self.upper_bounds = torch.tensor(feed_config["nutrient_bounds"]["upper"], device=self.device, dtype=self.precision)
+        self.lower_bounds = torch.tensor(feed_config["nutrient_bounds"]["lower"], device=self.device,
+                                         dtype=self.precision)
+        self.upper_bounds = torch.tensor(feed_config["nutrient_bounds"]["upper"], device=self.device,
+                                         dtype=self.precision)
         self.ingredient_lower_bounds = torch.tensor(feed_config["ingredient_bounds"]["lower"], device=self.device,
                                                     dtype=self.precision)
         self.ingredient_upper_bounds = torch.tensor(feed_config["ingredient_bounds"]["upper"], device=self.device,
@@ -93,7 +95,6 @@ class FeedEvaluator:
 
             return output
 
-
     def _check_constraints(self, X: torch.Tensor, nutrients: torch.Tensor, tol: float) -> torch.Tensor:
         """
         检查给定配方的所有约束
@@ -116,7 +117,6 @@ class FeedEvaluator:
         # 检查营养界
         nutrient_lower_check = torch.all(nutrients >= self.lower_bounds, dim=1)
         nutrient_upper_check = torch.all(nutrients <= self.upper_bounds, dim=1)
-
 
         # 必须满足所有约束
         return sum_check & ingredient_lower_check & ingredient_upper_check & nutrient_lower_check & nutrient_upper_check
@@ -187,3 +187,61 @@ class FeedEvaluator:
 
         return ineq_constraints, eq_constraints
 
+
+    def get_dynamic_constraint_evaluator(self, initial_penalty=10.0, decay_rate=0.8):
+        """
+        创建包含完整更新逻辑的动态约束评估器
+
+        Args:
+            initial_penalty: 初始惩罚系数（建议值10-100）
+            decay_rate: 每代惩罚系数衰减率（建议0.7-0.9）
+        """
+
+        class MOBOFeedConstraint:
+            def __init__(self, parent, penalty, decay):
+                self.parent = parent
+                self.current_penalty = penalty
+                self.decay = decay
+                self.iteration = 0
+
+            def update(self):
+                """每代衰减惩罚系数"""
+                self.current_penalty = max(0.1, self.current_penalty * self.decay)
+                self.iteration += 1
+
+            def __call__(self, X):
+                """计算带惩罚的目标值"""
+                original_shape = X.shape
+
+                # 转换输入为2D张量 [batch_size, num_ingredients]
+                X = X.reshape(-1, original_shape[-1])  # 展平为 [n_samples, d]
+                X = X.detach().clone().to(dtype=self.parent.precision, device=self.parent.device)
+
+                # 1. 计算原始约束违反
+                sum_viol = torch.abs(X.sum(dim=1) - 1.0).unsqueeze(1)  # [n,1]
+
+                # 2. 原料约束违反 (对每个原料单独计算)
+                ingredient_lower_viol = torch.relu(self.parent.ingredient_lower_bounds - X)  # [n,17]
+                ingredient_upper_viol = torch.relu(X - self.parent.ingredient_upper_bounds)  # [n,17]
+
+                # 3. 营养约束违反 (对每种营养素单独计算)
+                nutrients = X @ self.parent.nutrition  # [n,10]
+                nutrient_lower_viol = torch.relu(self.parent.lower_bounds - nutrients)  # [n,10]
+                nutrient_upper_viol = torch.relu(nutrients - self.parent.upper_bounds)  # [n,10]
+
+                # 4. 合并所有约束违反 (形状[n, 1+17+17+10+10=55])
+                violations = torch.cat([
+                    sum_viol,  # 总和约束 [n,1]
+                    ingredient_lower_viol,  # 原料下限 [n,17]
+                    ingredient_upper_viol,  # 原料上限 [n,17]
+                    nutrient_lower_viol,  # 营养下限 [n,10]
+                    nutrient_upper_viol  # 营养上限 [n,10]
+                ], dim=1)
+
+                # 5. 返回约束违反矩阵 [n, n_constraints]
+                return violations * self.current_penalty
+
+            def get_acquisition_constraints(self, dtype=None):
+                return self.parent.get_acquisition_constraints(dtype=dtype)
+
+        return MOBOFeedConstraint(self, initial_penalty, decay_rate)
