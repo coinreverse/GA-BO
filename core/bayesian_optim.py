@@ -171,8 +171,7 @@ class BOOptimizer:
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
             self.sampler = SobolQMCNormalSampler(
-                sample_shape=torch.Size([mc_samples]),
-                dimension=self.input_dim,  # 显式指定维度
+                sample_shape=torch.Size([mc_samples, self.input_dim]),  # 这里合并样本数和维度
                 seed=seed
             )
         else:
@@ -348,19 +347,15 @@ class BOOptimizer:
         return self._X, self._Y
 
     def optimize_step_qnehvi(self, evaluator) -> Tuple[torch.Tensor, torch.Tensor]:
-        weighted_Y = self._Y * self.weights.unsqueeze(0)
-        constraints = [lambda X: -evaluator(X)]
 
-        acq_func = qLogExpectedHypervolumeImprovement(
+
+        acq_func = qNoisyExpectedHypervolumeImprovement(
             model=self._model,
-            ref_point=self.ref_point * self.weights,
-            partitioning=FastNondominatedPartitioning(
-                ref_point=self.ref_point * self.weights,
-                Y=weighted_Y
-            ),
+            ref_point=self.ref_point,
             sampler=self.sampler,
-            # 关键修改：传入约束函数
-            constraints=constraints
+            X_baseline=self._X,  # 添加基线点
+            prune_baseline=True,  # 修剪基线
+            cache_root=False  # 禁用缓存
         )
 
         # 优化时使用原始约束
@@ -370,11 +365,11 @@ class BOOptimizer:
             acq_function=acq_func,
             bounds=self.bounds,
             q=1,
-            num_restarts=12,
-            raw_samples=256,
+            num_restarts=10,
+            raw_samples=512,
             inequality_constraints=ineq_constraints,
             equality_constraints=eq_constraints,
-            options={"batch_limit": 8, "maxiter": 150},
+            options={"batch_limit": 5, "maxiter": 200},
             sequential=True,
         )
 
