@@ -126,8 +126,6 @@ class BOOptimizer:
             weights: Optional[torch.Tensor] = None,
             initial_sample_size: Optional[int] = None,
             device: str = "cuda" if torch.cuda.is_available() else "cpu",
-            nutrient_bounds: Optional[Dict[str, List[float]]] = None,
-            ingredient_bounds: Optional[Dict[str, List[float]]] = None,
             tol: float = 0.05,
             mc_samples: int = 64,
             monitor_config: Optional[Dict] = None,
@@ -165,45 +163,29 @@ class BOOptimizer:
             'valid_ratio': []
         }
         self.mc_samples = mc_samples
-        self.input_dim = len(bounds['lower'])
         if seed is not None:
             torch.manual_seed(seed)
             if torch.cuda.is_available():
                 torch.cuda.manual_seed_all(seed)
             self.sampler = SobolQMCNormalSampler(
-                sample_shape=torch.Size([mc_samples, self.input_dim]),  # 这里合并样本数和维度
+                sample_shape=torch.Size([mc_samples]),  # 这里合并样本数和维度
                 seed=seed
             )
         else:
             self.sampler = SobolQMCNormalSampler(sample_shape=torch.Size([mc_samples]))
 
         self.tol = tol
-        if nutrient_bounds:
-            self.nutrient_lower = torch.tensor(nutrient_bounds['lower'],
-                                               device=self.device,
-                                               dtype=self.precision)
-            self.nutrient_upper = torch.tensor(nutrient_bounds['upper'],
-                                               device=self.device,
-                                               dtype=self.precision)
-        if ingredient_bounds:
-            self.ingredient_lower = torch.tensor(ingredient_bounds['lower'],
-                                                 device=self.device,
-                                                 dtype=self.precision)
-            self.ingredient_upper = torch.tensor(ingredient_bounds['upper'],
-                                                 device=self.device,
-                                                 dtype=self.precision)
 
-            # 添加监控器
-            self.monitor = None
-            if monitor_config:
-                self.monitor = self.BenchmarkMonitor(
-                    ref_point=ref_point,
-                    num_outputs=ref_point.shape[-1],
-                    dim=self.bounds.shape[-1],
-                    tkwargs={"device": self.device, "dtype": self.precision},
-                    obj=monitor_config.get("obj"),
-                    constraints=monitor_config.get("constraints"),
-                )
+        self.monitor = None
+        if monitor_config:
+            self.monitor = self.BenchmarkMonitor(
+                ref_point=ref_point,
+                num_outputs=ref_point.shape[-1],
+                dim=self.bounds.shape[-1],
+                tkwargs={"device": self.device, "dtype": self.precision},
+                obj=monitor_config.get("obj"),
+                constraints=monitor_config.get("constraints"),
+            )
 
     def _update_model(self):
         """更新高斯过程模型"""
@@ -218,7 +200,7 @@ class BOOptimizer:
                 ard_num_dims=X_train.shape[-1],
                 lengthscale_constraint=Interval(0.1, 10.0)  # 调整范围
             ),
-            outputscale_constraint=Interval(0.1, 5.0)
+            outputscale_constraint=Interval(0.5, 10.0)
         )
 
         mean_module = gpytorch.means.ConstantMean()
@@ -230,7 +212,7 @@ class BOOptimizer:
             input_transform=Normalize(d=X_train.shape[-1], bounds=self.bounds),
             outcome_transform=Standardize(m=Y_train.shape[-1]),
             # 添加均值模块
-            mean_module=mean_module,  # 使用线性均值
+            mean_module=mean_module,
         )
         # 设置噪声约束
         y_std = Y_train.std().item()
@@ -284,7 +266,7 @@ class BOOptimizer:
         )
 
         # 评估新点
-        new_Y = evaluator(candidates)
+        new_Y = evaluator.parent(candidates)
         self._X = torch.cat([self._X, candidates])
         self._Y = torch.cat([self._Y, new_Y])
         self._update_model()
@@ -348,14 +330,14 @@ class BOOptimizer:
 
     def optimize_step_qnehvi(self, evaluator) -> Tuple[torch.Tensor, torch.Tensor]:
 
-
-        acq_func = qNoisyExpectedHypervolumeImprovement(
+        X_baseline = self._X[is_non_dominated(self._Y)] if len(self._X) > 500 else self._X
+        acq_func = qLogNoisyExpectedHypervolumeImprovement(
             model=self._model,
             ref_point=self.ref_point,
             sampler=self.sampler,
-            X_baseline=self._X,  # 添加基线点
+            X_baseline=X_baseline,  # 添加基线点
             prune_baseline=True,  # 修剪基线
-            cache_root=False  # 禁用缓存
+            cache_root=True  # 缓存
         )
 
         # 优化时使用原始约束
@@ -364,13 +346,13 @@ class BOOptimizer:
         candidates, _ = optimize_acqf(
             acq_function=acq_func,
             bounds=self.bounds,
-            q=1,
-            num_restarts=10,
-            raw_samples=512,
+            q=4,
+            num_restarts=5,
+            raw_samples=218,
             inequality_constraints=ineq_constraints,
             equality_constraints=eq_constraints,
-            options={"batch_limit": 5, "maxiter": 200},
-            sequential=True,
+            options={"batch_limit": 4, "maxiter": 50, "disp": True},
+            sequential=False,
         )
 
         new_Y = evaluator(candidates)
@@ -386,7 +368,6 @@ class BOOptimizer:
             Y_init: torch.Tensor,
             n_iter: int = 20,
             evaluator=None,
-            use_dynamic_constraints: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         执行贝叶斯优化
@@ -423,24 +404,13 @@ class BOOptimizer:
             pred = self._model.posterior(normalize(self._X, self.bounds)).mean
             print(f"Model prediction range: {pred.min().item():.3f} to {pred.max().item():.3f}")
 
-        # 动态约束初始化
-        if use_dynamic_constraints and hasattr(evaluator, 'get_dynamic_constraint_evaluator'):
-            dynamic_evaluator = evaluator.get_dynamic_constraint_evaluator()
-            print("启用动态约束优化")
-        else:
-            dynamic_evaluator = evaluator
-            print("使用原始约束")
 
         for i in range(n_iter):
             self.current_iter += 1
             print(f"\n=== Iteration {self.current_iter} ===")
 
-            # 更新动态约束（每5代更新一次）
-            if use_dynamic_constraints and i % 5 == 0:
-                dynamic_evaluator.update()
-
             # 执行全局优化
-            self._X, self._Y = self.optimize_step_qnehvi(evaluator=dynamic_evaluator)
+            self._X, self._Y = self.optimize_step_qnehvi(evaluator=evaluator)
 
             if self.monitor:
                 self.monitor.update(self._X, self._Y)
@@ -450,7 +420,7 @@ class BOOptimizer:
             print(f"Model noise: {self._model.likelihood.noise}")
 
             # 记录并打印进展
-            self._update_history(evaluator=dynamic_evaluator)
+            self._update_history(evaluator=evaluator)
 
         return self._X, self._Y
 

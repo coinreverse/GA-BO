@@ -119,8 +119,6 @@ def main():
             ref_point=ref_point,
             weights=weights,
             initial_sample_size=bo_config['initial_sample_size'],
-            nutrient_bounds=feed_config['nutrient_bounds'],
-            ingredient_bounds=feed_config['ingredient_bounds'],
             monitor_config={  # 可选：监控配置
                 "obj": None,  # 可替换为自定义目标转换函数
                 "constraints": None  # 可添加约束函数列表

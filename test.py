@@ -11,8 +11,8 @@ torch.set_printoptions(
 )
 
 # 加载 .pt 文件
-# data = torch.load('results/ga_pareto_front.pt', map_location='cpu')  # 确保路径正确
-data = torch.load('results/hybrid_pareto_front.pt', map_location='cpu')  # 确保路径正确
+data = torch.load('results/ga_pareto_front.pt', map_location='cpu')  # 确保路径正确
+# data = torch.load('results/hybrid_pareto_front.pt', map_location='cpu')  # 确保路径正确
 
 # 打印文件内容的基本信息
 print("文件类型:", type(data))
