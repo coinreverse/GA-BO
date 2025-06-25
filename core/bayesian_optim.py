@@ -123,7 +123,6 @@ class BOOptimizer:
             self,
             bounds: Dict[str, List[float]],
             ref_point: Optional[torch.Tensor] = None,
-            weights: Optional[torch.Tensor] = None,
             initial_sample_size: Optional[int] = None,
             device: str = "cuda" if torch.cuda.is_available() else "cpu",
             tol: float = 0.05,
@@ -148,7 +147,6 @@ class BOOptimizer:
             dtype=self.precision
         )
         self.ref_point = ref_point.to(device=self.device, dtype=self.precision)
-        self.weights = weights.to(device=self.device, dtype=self.precision)
         self.initial_sample_size = initial_sample_size
 
         # 优化状态
@@ -293,7 +291,7 @@ class BOOptimizer:
         # 4. 带约束的优化（确保配方可行性）
         inequality_constraints, equality_constraints = evaluator.get_acquisition_constraints(dtype=self.precision)
 
-        weighted_Y = self._Y * self.weights
+
         # 5. 优化执行（增加可行性检查）
         for attempt in range(3):  # 最多尝试3次
             candidates, _ = optimize_acqf(
@@ -304,8 +302,8 @@ class BOOptimizer:
                     partitioning=FastNondominatedPartitioning(
                         ref_point=self.ref_point,
                         Y=torch.cat([
-                            self._model.posterior(normalize(self._X, self.bounds)).mean * self.weights,
-                            weighted_Y
+                            self._model.posterior(normalize(self._X, self.bounds)).mean,
+                            self._Y
                         ])
                     ),
                     sampler=self.sampler,

@@ -52,7 +52,6 @@ def main():
     evaluator = FeedEvaluator(config_path="configs/feed_config.yaml",
                               device='cuda' if torch.cuda.is_available() else 'cpu', precision='float32')
     ref_point = torch.tensor(hybrid_config['ref_point'])
-    weights = torch.tensor(hybrid_config['bo_weights'])
     strategy = HybridStrategy(ref_point)
 
     # 阶段1: GA全局探索
@@ -117,7 +116,6 @@ def main():
         bo = BOOptimizer(
             bounds=feed_config['ingredient_bounds'],  # 直接传入边界字典
             ref_point=ref_point,
-            weights=weights,
             initial_sample_size=bo_config['initial_sample_size'],
             monitor_config={  # 可选：监控配置
                 "obj": None,  # 可替换为自定义目标转换函数
@@ -125,18 +123,13 @@ def main():
             },
             seed=42
         )
-        # 在BO初始化后添加调试输出
-        print("权重验证 - 成本权重:", weights[0], "赖氨酸权重:", weights[-2], "能量权重:", weights[-1])
+
         print("目标方向验证 - 成本样本值:", Y_init[:, 0].min(), Y_init[:, 0].max())
 
-        # 运行BO前重置参考点
-        ref_point = ref_point.to(device=Y_init.device) * weights.to(device=Y_init.device)
 
         print("\n=== BO 配置检查 ===")
         print("参考点:", ref_point)
-        print("权重:", weights)
         print("初始样本目标值范围:", Y_init.min(dim=0).values, Y_init.max(dim=0).values)
-        print("参考点是否支配初始样本:", (Y_init < ref_point).all(dim=1).any())
         X_hybrid, Y_hybrid = bo.optimize(
             X_init=X_init,
             Y_init=Y_init,
