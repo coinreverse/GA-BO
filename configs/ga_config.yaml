@@ -5,15 +5,17 @@ n_gen: 300      # 进化代数
 
 # 交叉算子配置
 crossover:
-  prob: 0.9    # 交叉概率
+  prob: 0.7    # 交叉概率
   eta: 15      # 分布指数
 
 # 变异算子配置
 mutation:
-  prob: 0.3    # 变异概率
-  eta: 20      # 分布指数
+  prob: 0.4    # 变异概率
+  eta: 25      # 分布指数
 
 # 其他参数
-sampling: dirichlet
+dirichlet_ratio: 0.35
+#sampling: mixed
+#sampling: dirichlet
 #sampling: lhs
-#sampling: random
+sampling: random

@@ -3,6 +3,7 @@ import torch
 import yaml
 from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.core.population import Population
+from pymoo.core.sampling import Sampling
 from pymoo.operators.crossover.sbx import SBX
 from pymoo.operators.mutation.pm import PM
 from pymoo.optimize import minimize
@@ -59,17 +60,79 @@ class NormalizationRepair:
 # 自定义采样器 - 确保初始种群满足总和=1
 class DirichletSampling(FloatRandomSampling):
     def _do(self, problem, n_samples, **kwargs):
+        """执行Dirichlet采样的内部方法，返回种群对象"""
         # 生成严格满足总和=1的初始种群
         samples = np.random.dirichlet(np.ones(problem.n_var), size=n_samples)
-
         # 应用原料用量限制
         samples = samples * problem.xu  # 乘以各原料上限
-
         # 重新归一化确保总和=1
         row_sums = samples.sum(axis=1, keepdims=True)
+        # 避免除以0
+        row_sums[row_sums == 0] = 1e-6
         samples = samples / row_sums
+        # 返回Population对象
+        return Population.new(X=samples)
 
-        return samples
+    def do(self, problem, n_samples, **kwargs):
+        """PyMOO要求的接口方法"""
+        return self._do(problem, n_samples, **kwargs)
+
+    def __call__(self, problem, n_samples, **kwargs):
+        """使采样器成为可调用对象 (pymoo要求)"""
+        return self._do(problem, n_samples, **kwargs)
+
+
+class DirichletLHSSampling(Sampling):
+    def __init__(self, dirichlet_ratio=0.5):
+        """
+        混合采样器 - 结合Dirichlet和LHS采样方法
+
+        Args:
+            dirichlet_ratio: Dirichlet样本比例 (默认为0.5)
+        """
+        super().__init__()
+        self.dirichlet_ratio = dirichlet_ratio
+
+    def _do(self, problem, n_samples, **kwargs):
+        """执行混合采样的内部方法"""
+        # 计算每种采样的数量
+        n_dirichlet = int(n_samples * self.dirichlet_ratio)
+        n_lhs = n_samples - n_dirichlet
+
+        # Dirichlet采样
+        dirichlet_sampler = DirichletSampling()
+        dirichlet_samples = dirichlet_sampler._do(problem, n_dirichlet)
+
+        # LHS采样
+        lhs_sampler = LHS()
+        lhs_samples = lhs_sampler._do(problem, n_lhs)
+
+        # 处理不同采样器返回的类型
+        def ensure_population(sample_obj):
+            """确保返回的是Population对象"""
+            if isinstance(sample_obj, np.ndarray) and sample_obj.ndim == 2:
+                return Population.new(X=sample_obj)
+            return sample_obj
+
+        dirichlet_pop = ensure_population(dirichlet_samples)
+        lhs_pop = ensure_population(lhs_samples)
+
+        # 合并两种采样的种群
+        combined_pop = Population.merge(dirichlet_pop, lhs_pop)
+
+        # 应用修复算子确保符合约束
+        repair = NormalizationRepair(problem.xu)
+        repaired_pop = repair.do(problem, combined_pop)
+
+        return repaired_pop
+
+    def do(self, problem, n_samples, **kwargs):
+        """PyMOO要求的接口方法"""
+        return self._do(problem, n_samples, **kwargs)
+
+    def __call__(self, problem, n_samples, **kwargs):
+        """使采样器成为可调用对象 (pymoo要求)"""
+        return self._do(problem, n_samples, **kwargs)
 
 
 class FeedProblem(Problem):
@@ -171,7 +234,7 @@ class FeedProblem(Problem):
         self.best_solutions.append(best_solution.cpu().numpy())
 
 
-def compute_hypervolume(F: torch.Tensor, ref_point: torch.Tensor, nutrient_names: list) -> float:
+def compute_hypervolume(F: torch.Tensor, ref_point: torch.Tensor) -> float:
     """
     计算超体积 (Hypervolume, HV) 的独立函数
 
@@ -199,8 +262,8 @@ def compute_hypervolume(F: torch.Tensor, ref_point: torch.Tensor, nutrient_names
     # 3. 调整参考点（与目标方向一致）
     hv_ref_point = np.array([
         ref_point[0],  # 成本（最小化）
-        -ref_point[1],  # 赖氨酸（转为最小化）
-        -ref_point[2]  # 能量（转为最小化）
+        -ref_point[10],  # 赖氨酸（转为最小化）  1不是赖氨酸
+        -ref_point[9]  # 能量（转为最小化）    2不是能量，这里的设置可能有问题
     ])
 
     # 4. 计算非支配前沿
@@ -227,12 +290,9 @@ class HVTermination(Termination):
         self.sampling_method = sampling_method   # 采样方法
 
     def _update(self, algorithm):
-        if self.sampling_method == "lhs":
-            if algorithm.n_gen <= 20:
-                return False
-        if self.sampling_method == "random":
-            if algorithm.n_gen <= 20:
-                return False
+        if self.sampling_method is not None and algorithm.n_gen <= 20:
+            return False
+
         # 获取当前种群
         pop = algorithm.pop
         X = torch.tensor(pop.get("X"), dtype=torch.float32, device=self.evaluator.device)
@@ -249,7 +309,7 @@ class HVTermination(Termination):
             objectives[:, energy_idx]  # 能量
         ], dim=1)
 
-        hv_val = compute_hypervolume(F, self.ref_point, nutrient_names)
+        hv_val = compute_hypervolume(F, self.ref_point)
         self.hv_history.append(hv_val)
 
         # 计算改进率
@@ -305,10 +365,16 @@ def run_ga(
     sampling_mapping = {
         "random": FloatRandomSampling(),
         "lhs": LHS(),
-        "dirichlet": DirichletSampling()
+        "dirichlet": DirichletSampling(),
+        "mixed": DirichletLHSSampling()
     }
-    sampling_method = config.get("sampling", "dirichlet")  # 默认使用dirichlet
-    sampling = sampling_mapping.get(sampling_method.lower())
+    sampling_method = config.get("sampling", "mixed")  # 默认使用dirichlet
+
+    if sampling_method.lower() == "mixed":
+        dirichlet_ratio = config.get("dirichlet_ratio", 0.5)  # 默认为0.5
+        sampling = DirichletLHSSampling(dirichlet_ratio=dirichlet_ratio)
+    else:
+        sampling = sampling_mapping.get(sampling_method.lower())
 
     # 配置遗传算法
     algorithm = NSGA2(

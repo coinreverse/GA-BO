@@ -5,10 +5,13 @@ import torch
 import time
 from typing import Dict, Any
 import yaml
+from matplotlib import pyplot as plt
+
 from core.genetic_algorithm import run_ga
 from core.bayesian_optim import BOOptimizer
 from core.evaluator import FeedEvaluator
 from core.hybrid_strategy import HybridStrategy
+from utils.Comparative_sampling import plot_ga_results
 from utils.plot_ga_convergence import plot_convergence
 
 torch.set_default_tensor_type(torch.cuda.DoubleTensor)  # 全局默认 CUDA
@@ -75,6 +78,19 @@ def main():
         best_solutions=ga_metadata["best_solutions"],
         save_path="results/ga_convergence.png"  # 可选保存路径
     )
+    # 绘制解集散布图
+    strategy_name="random"
+    plot_ga_results(
+        X_ga=X_ga,
+        Y_ga=Y_ga,
+        meta_ga={
+            "best_solutions": ga_metadata["best_solutions"],
+            "hv_history": ga_hv_history
+        },
+        ref_point=ref_point,
+        title_suffix=f"({strategy_name})"
+    )
+
     # 最终结果处理
     elite_ga_X, elite_ga_Y = strategy.elite_selection(
         X_ga, Y_ga,

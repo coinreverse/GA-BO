@@ -7,12 +7,12 @@ torch.set_printoptions(
     threshold=float('inf'),  # 禁用截断
     edgeitems=30,  # 显示首尾各30项
     sci_mode=False,  # 禁用科学计数法
-    precision=2  # 设置显示精度为2位小数
+    precision=4  # 设置显示精度为2位小数
 )
 
 # 加载 .pt 文件
-# data = torch.load('results/ga_pareto_front.pt', map_location='cpu')  # 确保路径正确
-data = torch.load('results/hybrid_pareto_front.pt', map_location='cpu')  # 确保路径正确
+data = torch.load('results/ga_pareto_front.pt', map_location='cpu')  # 确保路径正确
+# data = torch.load('results/hybrid_pareto_front.pt', map_location='cpu')  # 确保路径正确
 
 # 打印文件内容的基本信息
 print("文件类型:", type(data))
@@ -31,7 +31,7 @@ else:
 
 
 # 格式化打印张量数据
-def format_tensor(tensor, decimals=2):
+def format_tensor(tensor, decimals=4):
     """格式化张量显示，保留指定位数小数"""
     return torch.round(tensor * 10**decimals) / (10**decimals)
 
